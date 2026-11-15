@@ -35,7 +35,8 @@ jobs:
         run: |
           python -m venv .venv
           if [ -f .venv/Scripts/activate ]; then source .venv/Scripts/activate; else source .venv/bin/activate; fi
-          pip install maturin pytest "langchain-core>=1.0" "langgraph>=1.0" "langsmith>=0.4"
+          pip install maturin pytest "langchain-core>=1.0" "langgraph>=1.0" "langsmith>=0.4" "mcp>=1.2"
           maturin develop --release
           pytest -q
           python examples/team_graph.py
+          python evals/run.py --check

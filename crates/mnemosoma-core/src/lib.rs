@@ -13,4 +13,4 @@ pub mod store;
 
 pub use identity::{default_roles, Grant, Identity, RolePolicy, Scope, ScopeKind};
 pub use memory::{Assertion, Memory, MemoryKind, NewMemory, Trust};
-pub use store::{now_ms, Error, Hit, MemoryStore, Query, Stats, StoreConfig, SweepReport};
+pub use store::{now_ms, Error, Hit, MemoryStore, Query, Stats, StoreConfig, SweepReport, Why};

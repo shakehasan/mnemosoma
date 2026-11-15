@@ -71,6 +71,9 @@ fn default_k() -> usize {
 fn default_min_trust() -> Trust {
     Trust::Standard
 }
+fn default_graph_hops() -> u8 {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Query {
@@ -100,6 +103,10 @@ pub struct Query {
     pub min_trust: Trust,
     #[serde(default)]
     pub include_archived: bool,
+    /// How many steps to follow shared entities out from the best matches.
+    /// `0` turns graph expansion off.
+    #[serde(default = "default_graph_hops")]
+    pub graph_hops: u8,
 }
 
 impl Query {
@@ -114,8 +121,22 @@ impl Query {
             as_of: None,
             min_trust: default_min_trust(),
             include_archived: false,
+            graph_hops: default_graph_hops(),
         }
     }
+}
+
+/// Why a memory was returned: its rank in each ranker (1 is best, `None`
+/// means that ranker did not pick it) and whose grant made it visible.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Why {
+    pub keyword_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+    pub entity_rank: Option<usize>,
+    /// Reached by following shared entities from a better match.
+    pub graph_rank: Option<usize>,
+    /// Set when the memory belongs to another user who shared it.
+    pub shared_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +145,7 @@ pub struct Hit {
     pub score: f32,
     /// False for an agent's inference that nobody has corroborated yet.
     pub established: bool,
+    pub why: Why,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -187,6 +209,13 @@ struct Segment {
     postings: HashMap<String, Vec<(u32, u32)>>,
     with_entities: Vec<u32>,
     with_embedding: Vec<u32>,
+    /// Lower-cased entity name to the rows that mention it: the edges of the
+    /// entity graph.
+    entity_rows: HashMap<String, Vec<u32>>,
+}
+
+fn entity_names(m: &Memory) -> BTreeSet<String> {
+    m.entities.iter().filter(|e| !e.trim().is_empty()).map(|e| e.to_lowercase()).collect()
 }
 
 /// One segment as a particular caller sees it for a particular query.
@@ -339,6 +368,9 @@ impl MemoryStore {
                 if !m.entities.is_empty() {
                     segment.with_entities.push(row);
                 }
+                for name in entity_names(&m) {
+                    segment.entity_rows.entry(name).or_default().push(row);
+                }
                 if m.embedding.is_some() {
                     segment.with_embedding.push(row);
                 }
@@ -384,6 +416,14 @@ impl MemoryStore {
                                 }
                                 if list.is_empty() {
                                     segment.postings.remove(&term);
+                                }
+                            }
+                        }
+                        for name in entity_names(&m) {
+                            if let Some(list) = segment.entity_rows.get_mut(&name) {
+                                list.retain(|r| *r != row);
+                                if list.is_empty() {
+                                    segment.entity_rows.remove(&name);
                                 }
                             }
                         }
@@ -827,6 +867,63 @@ impl MemoryStore {
         top_ids(scored, pool)
     }
 
+    /// Graph expansion by spreading activation. Each starting memory passes a
+    /// share of its score along every entity it mentions to the other
+    /// memories that mention it; a further hop passes on a share of that.
+    /// An entity mentioned by many memories passes on less to each, so a
+    /// common name does not flood the results. Only eligible rows are ever
+    /// visited, and a memory never earns credit from its own entities.
+    fn spread(&self, views: &[View], seeds: &[(u64, f32)], hops: u8) -> Vec<(u64, f32)> {
+        const CARRY: f32 = 0.7;
+        let mut frontier: Vec<(u64, f32)> = seeds.to_vec();
+        let mut reached: HashMap<u64, f32> = HashMap::new();
+        for _ in 0..hops {
+            // Entity name to the frontier memories that mention it.
+            let mut mentions: HashMap<String, Vec<(u64, f32)>> = HashMap::new();
+            for (id, activation) in &frontier {
+                for name in self.memories.get(id).map(entity_names).unwrap_or_default() {
+                    mentions.entry(name).or_default().push((*id, *activation));
+                }
+            }
+            let mut found: HashMap<u64, f32> = HashMap::new();
+            for (name, sources) in &mentions {
+                let mut mentioned_by: Vec<u64> = Vec::new();
+                for view in views {
+                    let seg = &self.segments[view.segment];
+                    for row in seg.entity_rows.get(name).into_iter().flatten() {
+                        if view.mask[*row as usize] {
+                            mentioned_by.push(seg.rows[*row as usize].id);
+                        }
+                    }
+                }
+                let spread_over = (mentioned_by.len().saturating_sub(1).max(1) as f32).sqrt();
+                for id in mentioned_by {
+                    if reached.contains_key(&id) {
+                        continue;
+                    }
+                    let strongest = sources
+                        .iter()
+                        .filter(|(source, _)| *source != id)
+                        .map(|(_, activation)| *activation)
+                        .fold(0.0, f32::max);
+                    if strongest > 0.0 {
+                        *found.entry(id).or_insert(0.0) += CARRY * strongest / spread_over;
+                    }
+                }
+            }
+            if found.is_empty() {
+                break;
+            }
+            frontier = found.iter().map(|(id, activation)| (*id, *activation)).collect();
+            sort_desc(&mut frontier);
+            frontier.truncate(16);
+            reached.extend(found);
+        }
+        let mut out: Vec<(u64, f32)> = reached.into_iter().collect();
+        sort_desc(&mut out);
+        out
+    }
+
     /// Recall memories for a caller. Filters run before ranking, so a memory
     /// the caller may not read never reaches a ranker.
     pub fn recall(&mut self, who: &Identity, q: &Query, now: i64) -> Vec<Hit> {
@@ -839,6 +936,7 @@ impl MemoryStore {
         }
         let pool = (q.k * 4).max(32);
 
+        let mut rankings: [Vec<u64>; 4] = Default::default();
         let mut scored: Vec<(u64, f32)> = if q.text.trim().is_empty() && q.embedding.is_none() {
             // No query: newest first. Used to read a blackboard or a handoff.
             let mut newest: Vec<(i64, u64)> = Vec::with_capacity(count);
@@ -857,18 +955,39 @@ impl MemoryStore {
             let keyword = self.rank_keyword(&views, &tokenize(&q.text), count, length, pool);
             let vector = self.rank_vector(&views, q, pool);
             let entity = self.rank_entity(&views, &q.text, pool);
-            rrf(&[keyword, vector, entity])
+            let mut fused = rrf(&[keyword.clone(), vector.clone(), entity.clone()]);
+
+            // The best few matches from each ranker are where the graph starts.
+            let mut seeds: Vec<(u64, f32)> = Vec::new();
+            for id in [&keyword, &vector, &entity].into_iter().flat_map(|list| list.iter().take(5)) {
+                if !seeds.iter().any(|(seen, _)| seen == id) {
+                    seeds.push((*id, fused[id]));
+                }
+            }
+            let reached = if q.graph_hops == 0 { vec![] } else { self.spread(&views, &seeds, q.graph_hops) };
+            for (id, activation) in &reached {
+                *fused.entry(*id).or_insert(0.0) += activation;
+            }
+            rankings = [keyword, vector, entity, reached.into_iter().map(|r| r.0).collect()];
+
+            // Relevance decides the order. Rank fusion packs scores close
+            // together: the best match in two rankers leads the next by under
+            // two percent. So confirmation, trust and salience are kept to
+            // about one percent each, enough to settle near-ties and never
+            // enough to put a recently used memory above a clearly better
+            // match. Untrusted content, when asked for, is set clearly lower.
+            fused
                 .into_iter()
-                .map(|(id, fused)| {
+                .map(|(id, relevance)| {
                     let m = &self.memories[&id];
                     let trust = match m.trust {
                         Trust::Trusted => 1.0,
-                        Trust::Standard => 0.9,
-                        Trust::Untrusted => 0.6,
+                        Trust::Standard => 0.99,
+                        Trust::Untrusted => 0.9,
                     };
-                    let established = if m.established() { 1.0 } else { 0.85 };
-                    let salience = 0.5 + 0.5 * m.salience * self.decay(m, now);
-                    (id, fused * trust * established * salience)
+                    let established = if m.established() { 1.0 } else { 0.99 };
+                    let salience = 0.99 + 0.01 * m.salience * self.decay(m, now);
+                    (id, relevance * trust * established * salience)
                 })
                 .collect()
         };
@@ -889,7 +1008,18 @@ impl MemoryStore {
             used += cost;
             let mut memory = m.clone();
             memory.embedding = None;
-            hits.push(Hit { established: memory.established(), memory, score });
+            let rank_in = |list: &Vec<u64>| list.iter().position(|x| *x == id).map(|at| at + 1);
+            let why = Why {
+                keyword_rank: rank_in(&rankings[0]),
+                vector_rank: rank_in(&rankings[1]),
+                entity_rank: rank_in(&rankings[2]),
+                graph_rank: rank_in(&rankings[3]),
+                shared_by: match &memory.scope {
+                    Scope::UserPrivate(owner) if *owner != who.user => Some(owner.clone()),
+                    _ => None,
+                },
+            };
+            hits.push(Hit { established: memory.established(), memory, score, why });
         }
         // Being recalled is what keeps a memory from decaying.
         for hit in &hits {

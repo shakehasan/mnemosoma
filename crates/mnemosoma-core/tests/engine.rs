@@ -468,3 +468,101 @@ fn the_log_replays_and_rejects_tampering() {
     assert_eq!(s.stats().memories, 0);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn graph_expansion_reaches_memories_linked_by_an_entity() {
+    let mut s = store();
+    let a = who("acme", "ana", "r1", "researcher");
+    let scope = Scope::Team("task-1".into());
+    let with = |text: &str, entities: &[&str]| {
+        let mut m = fact(scope.clone(), text);
+        m.entities = entities.iter().map(|e| e.to_string()).collect();
+        m
+    };
+    s.write(&a, with("The venue contract was signed by Dana", &["Dana"]), T0).unwrap();
+    // Shares no words with the question; linked to the first only through Dana.
+    s.write(&a, with("Her direct line is extension 4417", &["Dana", "Extension 4417"]), T0).unwrap();
+    // Two hops from the first: linked to the second through the extension.
+    s.write(&a, with("Phone numbers were reassigned in October", &["Extension 4417"]), T0).unwrap();
+    // Memories that match the question's words, so the two above are not
+    // among the starting points on their own merit.
+    for text in [
+        "The venue has free parking",
+        "The contract template is in the shared drive",
+        "Nobody has signed the catering order",
+        "The venue floor plan is attached",
+        "The contract renewal is due in May",
+        "The venue opens at nine",
+        "The signed lease is with legal",
+        "The venue contact sheet is out of date",
+    ] {
+        s.write(&a, fact(scope.clone(), text), T0).unwrap();
+    }
+
+    let question = "who signed the venue contract";
+    let find = |hits: &[Hit], text: &str| hits.iter().find(|h| h.memory.content == text).map(|h| h.why.clone());
+    let mut q = Query::text(question);
+    q.k = 20;
+
+    let hits = s.recall(&a, &q, T0 + 2);
+    assert_eq!(hits[0].memory.content, "The venue contract was signed by Dana");
+    assert_eq!(hits[0].why.keyword_rank, Some(1));
+    let linked = find(&hits, "Her direct line is extension 4417").expect("reached through Dana");
+    assert_eq!((linked.graph_rank, linked.keyword_rank), (Some(1), None));
+    let far = find(&hits, "Phone numbers were reassigned in October");
+    assert!(far.is_none_or(|w| w.graph_rank.is_none()), "one hop must not reach two hops away");
+
+    // A second hop follows the extension as well.
+    q.graph_hops = 2;
+    let hits = s.recall(&a, &q, T0 + 2);
+    let far = find(&hits, "Phone numbers were reassigned in October").expect("reached in two hops");
+    assert!(far.graph_rank.is_some());
+
+    // With expansion off, nothing is reached through the graph.
+    q.graph_hops = 0;
+    assert!(s.recall(&a, &q, T0 + 2).iter().all(|h| h.why.graph_rank.is_none()));
+}
+
+#[test]
+fn graph_expansion_never_crosses_a_permission_boundary() {
+    let mut s = store();
+    let ana = who("acme", "ana", "r1", "researcher");
+    let bo = who("acme", "bo", "r2", "researcher");
+    let mut public = fact(Scope::Team("task-1".into()), "Dana runs the venue");
+    public.entities = vec!["Dana".into()];
+    s.write(&ana, public, T0).unwrap();
+    let mut private = fact(Scope::UserPrivate("ana".into()), "Ana owes a personal favour");
+    private.entities = vec!["Dana".into()];
+    s.write(&ana, private, T0).unwrap();
+
+    let hits = s.recall(&bo, &Query::text("who runs the venue"), T0);
+    assert_eq!(contents(&hits), ["Dana runs the venue"]);
+    // The owner does reach it, and is told it came through the graph.
+    let hits = s.recall(&ana, &Query::text("who runs the venue"), T0);
+    assert!(hits.iter().any(|h| h.memory.content.starts_with("Ana owes") && h.why.graph_rank.is_some()));
+}
+
+#[test]
+fn a_shared_memory_says_who_shared_it() {
+    let mut s = store();
+    let ana = who("acme", "ana", "r1", "researcher");
+    let bo = who("acme", "bo", "r2", "researcher");
+    s.write(&ana, fact(Scope::UserPrivate("ana".into()), "Falcon ships in March"), T0).unwrap();
+    s.grant(&ana, "bo", None, None).unwrap();
+    assert_eq!(s.recall(&bo, &Query::text("falcon"), T0)[0].why.shared_by.as_deref(), Some("ana"));
+    assert_eq!(s.recall(&ana, &Query::text("falcon"), T0)[0].why.shared_by, None);
+}
+
+#[test]
+fn a_recently_used_memory_does_not_outrank_a_better_match() {
+    let mut s = store();
+    let a = who("acme", "ana", "r1", "researcher");
+    let scope = Scope::UserPrivate("ana".into());
+    s.write(&a, fact(scope.clone(), "Ana's diet is vegetarian"), T0).unwrap();
+    s.write(&a, fact(scope, "Ana's city is Lisbon"), T0).unwrap();
+
+    // A year on, the diet fact has just been used and the city fact never has.
+    let later = T0 + 365 * DAY;
+    assert_eq!(s.recall(&a, &Query::text("what is Ana's diet"), later)[0].memory.content, "Ana's diet is vegetarian");
+    assert_eq!(s.recall(&a, &Query::text("what is Ana's city"), later)[0].memory.content, "Ana's city is Lisbon");
+}
