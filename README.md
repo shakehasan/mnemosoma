@@ -42,6 +42,7 @@ store.recall(ana, "where does ana work", as_of=june)   # -> "Ana works at Initec
 | **Multi-agent, multi-tenant memory** | Six scopes, per-role policies and hard tenant boundaries, enforced in the engine |
 | **Zero-trust recall** | Every read is checked against the caller's identity; the model never chooses who it is |
 | **Hybrid retrieval** | BM25, vector and entity rankers combined with reciprocal rank fusion |
+| **Approximate vector search** | An HNSW index per scope, filtered so it only returns what the caller may read |
 | **Graph retrieval** | Multi-hop expansion along shared entities, for answers that share no words with the question |
 | **Temporal knowledge** | Bi-temporal facts, supersession chains and point-in-time queries |
 | **Explainable recall** | Each hit reports which rankers chose it and who shared it |
@@ -51,10 +52,11 @@ store.recall(ana, "where does ana work", as_of=june)   # -> "Ana works at Initec
 | **Sleep-time consolidation** | A background pass turns episodes into linked facts, off the hot path |
 | **Context engineering** | Token-budgeted prompt blocks grouped by reliability, with provenance |
 | **MCP server** | Any Model Context Protocol client can use the store through four tools |
-| **LangChain and LangGraph** | Retriever, agent tools and a multi-agent graph example |
+| **LangChain and LangGraph** | Retriever, agent tools, a drop-in LangGraph `BaseStore` and a multi-agent graph example |
 | **Observability** | Optional LangSmith traces of every write and recall |
 | **Async and thread-safe** | Awaitable API; the Rust engine releases Python's interpreter lock |
 | **Eval-gated CI** | A behaviour eval suite and a leak-checked load benchmark run on every push |
+| **Cross-platform wheels** | A release pipeline builds wheels for Linux, macOS and Windows and tests them before publishing |
 | **Right to erasure** | Cascading delete that removes derived facts and rewrites the log |
 
 Everything in this table is built and tested. What is not built yet is listed under [What is built and what is not](#what-is-built-and-what-is-not).
@@ -384,7 +386,16 @@ tools = memory_tools(store, ana, write_scope=Scope.team("launch"))
 
 The tools write as the identity they were created with. The model decides what to remember and what to look up. It has no argument that changes who it is, so a prompt injection cannot make it read another user's memory. What a model writes through `remember` is recorded as that agent's inference.
 
-**LangGraph.** Give each node its own identity and pass the store in. See [`examples/team_graph.py`](examples/team_graph.py).
+**LangGraph.** Graphs that already use LangGraph's long-term memory API can switch to Mnemosoma without changing node code. `MnemosomaStore` implements LangGraph's `BaseStore`:
+
+```python
+from mnemosoma.langgraph_store import MnemosomaStore
+
+store = MnemosomaStore(memory, identity=ana, scope=Scope.user("ana"))
+graph = builder.compile(store=store)        # nodes keep calling store.put / get / search
+```
+
+A `(namespace, key)` pair becomes one fact: putting it again supersedes the old value and keeps it in `history()`, and deleting it erases every version. The store acts as one identity, so two users' graphs cannot read each other's values whatever namespace they ask for, and search leaves out values a guard marked untrusted. For graphs that want each node to act as its own agent, see [`examples/team_graph.py`](examples/team_graph.py).
 
 **LangSmith.** Optional. With `langsmith` installed and `LANGSMITH_TRACING=true`, each write and recall appears as a step in the trace of the agent run that made it. Traces include memory text, so enable it only where that is acceptable. Nothing is sent otherwise.
 
@@ -423,7 +434,7 @@ pip install "mnemosoma[mcp]"
 }
 ```
 
-One server process is one identity, set by whoever configures it. The client's model chooses what to remember and look up, and has no way to choose whose memory it sees. The server turns the injection guard on.
+One server process is one identity, set by whoever configures it. The client's model chooses what to remember and look up, and has no way to choose whose memory it sees. The server turns the injection guard on. The tests start it as a separate process and drive it through the MCP client library over stdio, including a restart that reads the same log back.
 
 ## Evaluation
 
@@ -457,15 +468,15 @@ How to read this:
 
 ## Capacity
 
-Measured with [`crates/mnemosoma-core/examples/load.rs`](crates/mnemosoma-core/examples/load.rs) on a laptop: Intel Core i7-1260P, 16 GB RAM, Windows 11, release build, one thread, in-memory store, built-in embedder. Each tenant has 100 users, 20 agents in 4 roles and 10 teams. Every returned memory is re-checked against the scope rules.
+Measured with [`crates/mnemosoma-core/examples/load.rs`](crates/mnemosoma-core/examples/load.rs) on a laptop: Intel Core i7-1260P (12 cores), 16 GB RAM, Windows 11, release build, in-memory store, built-in embedder. Writes and recalls run on one thread; the index build uses all cores. Each tenant has 100 users, 20 agents in 4 roles and 10 teams. Every returned memory is re-checked against the scope rules.
 
-| Memories | Tenants | Readable per caller | Writes per second | Recall p50 | Recall p95 | Permission leaks |
-|---|---|---|---|---|---|---|
-| 100,000 | 10 | about 750 | 52,000 | 0.13 ms | 0.17 ms | 0 of 16,000 hits |
-| 1,000,000 | 100 | about 750 | 47,000 | 0.20 ms | 0.26 ms | 0 of 16,000 hits |
-| 1,000,000 | 1 | about 75,000 | 62,000 | 8.9 ms | 12.8 ms | 0 of 4,000 hits |
+| Memories | Tenants | Readable per caller | Writes per second | Index build | Recall p50 | Recall p95 | Permission leaks |
+|---|---|---|---|---|---|---|---|
+| 100,000 | 10 | about 750 | 77,000 | 0.6 s | 0.12 ms | 0.15 ms | 0 of 16,000 hits |
+| 1,000,000 | 100 | about 750 | 64,000 | 6.7 s | 0.14 ms | 0.16 ms | 0 of 16,000 hits |
+| 1,000,000 | 1 | about 75,000 | 80,000 | 72 s | 2.4 ms | 2.7 ms | 0 of 4,000 hits |
 
-Write speed varied between about 45,000 and 75,000 per second from run to run on this machine.
+Write speed varied between about 40,000 and 80,000 per second from run to run on this machine.
 
 Run it yourself:
 
@@ -476,29 +487,30 @@ cargo run --release -p mnemosoma-core --example load -- 1000000 100
 What these numbers do and do not show:
 
 - Recall cost follows the number of memories the caller is allowed to read, not the size of the store. The first two rows hold the same readable set while the store grows tenfold, and recall time barely moves.
-- The third row is the hard case: one tenant, with each caller able to read about 75,000 memories. Memories are stored by column in one segment per scope. Keyword ranking goes through posting lists, and vector ranking is an exact scan over the readable rows.
-- Vector scoring is still exact, with no approximate index. Recall time will keep growing in step with the readable set, so a caller who can read millions of memories needs the approximate index on the roadmap.
-- The store is one process. Writers take turns behind one lock; at these write speeds that was not the bottleneck, but multi-threaded throughput has not been measured.
+- The third row is the hard case: one tenant, with each caller able to read about 75,000 memories. There, vector ranking goes through an HNSW graph per scope. Before the index it took 8.9 ms at p50; the index brings it to 2.4 ms.
+- Scopes with fewer than 4,096 readable memories, or where the caller can read under 5% of the scope, are scored exactly: at that size a scan is fast and has perfect recall. The approximate index matches the exact top 10 for at least 90% of results in the tests.
+- Writes do not wait for the index. It catches up on first use, or all at once with `build_index()` after a bulk load, which is what the "Index build" column times.
+- The store is one process. Writers take turns behind one lock; multi-threaded write throughput has not been measured.
 - Durability is an append-only file with no fsync per write. Server mode and Postgres are not built.
 
 ## What is built and what is not
 
 | Area | Built and tested | Planned |
 |---|---|---|
-| Engine | Scopes, role policies, grants, taint, bi-temporal chains, signed log, decay, TTL, erasure, columnar segments, inverted keyword index | Approximate vector index, sharding |
+| Engine | Scopes, role policies, grants, taint, bi-temporal chains, signed log, decay, TTL, erasure, columnar segments, inverted keyword index, filtered HNSW vector index with parallel build | Sharding across machines |
 | Retrieval | BM25, vector, entity match, rank fusion, graph expansion, token budget, point-in-time, explainable hits, pluggable reranker | Entity extraction at write time, learned reranker |
 | Safety | Trust tiers, signed provenance, injection guard, PII guard, review queue | Model-based injection detection |
 | Python | Typed SDK, async API, pluggable embedder, consolidator, prompt context | Streaming consolidation |
-| Integrations | LangChain retriever and tools, LangGraph example, MCP server, optional LangSmith tracing | LangGraph `BaseStore` adapter |
+| Integrations | LangChain retriever and tools, LangGraph `BaseStore`, LangGraph example, MCP server tested over stdio, optional LangSmith tracing | |
 | Storage | In-memory and single-file log | Postgres backend, server mode |
-| Evaluation | 24 engine tests, 23 SDK tests, behaviour eval suite, load benchmark | LongMemEval and LoCoMo runs under a published protocol |
-| Packaging | Builds from source, CI on Linux, macOS and Windows | PyPI and crates.io releases |
+| Evaluation | 29 engine tests, 32 SDK tests, behaviour eval suite, load benchmark | LongMemEval and LoCoMo runs under a published protocol |
+| Packaging | CI on Linux, macOS and Windows; release pipeline for wheels on five platforms, source distribution and crate ([RELEASING.md](RELEASING.md)) | First release to PyPI and crates.io |
 
 No end-to-end answer-quality benchmark has been run yet. This README makes no claim about LongMemEval or LoCoMo, and it will not until the results come from a run anyone can repeat. LangSmith tracing has been tested only with tracing switched off.
 
 ## Install and develop
 
-Not on PyPI yet. Build from source with Rust and Python 3.10 or newer:
+Not on PyPI yet; the release pipeline is ready and waits on the first tagged version. Until then, build from source with Rust and Python 3.10 or newer:
 
 ```bash
 pip install maturin pytest "langchain-core>=1.0" "langgraph>=1.0" "mcp>=1.2"
@@ -529,9 +541,9 @@ On Windows this was built with the GNU Rust toolchain, which needs an LLVM `dllt
 Layout:
 
 ```text
-crates/mnemosoma-core/   Rust engine: identity, memory, provenance, index, store
+crates/mnemosoma-core/   Rust engine: identity, memory, provenance, index, HNSW, store
 crates/mnemosoma-py/     PyO3 bindings
-python/mnemosoma/        SDK, consolidation, guards, context, LangChain, MCP server, tracing
+python/mnemosoma/        SDK, consolidation, guards, context, LangChain, LangGraph store, MCP server, tracing
 examples/                LangGraph multi-agent example
 evals/                   Behaviour eval suite
 tests/                   Python tests

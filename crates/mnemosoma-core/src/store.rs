@@ -1,6 +1,7 @@
 //! The memory store: an append-only event log, the indexes rebuilt from it,
 //! and the read and write paths.
 
+use crate::ann::Hnsw;
 use crate::identity::{default_roles, Grant, Identity, RolePolicy, Scope, ScopeKind};
 use crate::index::{cosine, dot, hash_embed, rrf, sort_desc, tokenize, top_ids, HASH_DIM};
 use crate::memory::{Assertion, Memory, MemoryKind, NewMemory, Trust};
@@ -107,6 +108,9 @@ pub struct Query {
     /// `0` turns graph expansion off.
     #[serde(default = "default_graph_hops")]
     pub graph_hops: u8,
+    /// Score every eligible vector instead of using the approximate index.
+    #[serde(default)]
+    pub exact: bool,
 }
 
 impl Query {
@@ -122,6 +126,7 @@ impl Query {
             min_trust: default_min_trust(),
             include_archived: false,
             graph_hops: default_graph_hops(),
+            exact: false,
         }
     }
 }
@@ -212,10 +217,67 @@ struct Segment {
     /// Lower-cased entity name to the rows that mention it: the edges of the
     /// entity graph.
     entity_rows: HashMap<String, Vec<u32>>,
+    /// Approximate index over `vecs`; node n is row n.
+    hash_ann: Hnsw,
+    emb: Option<Embeddings>,
 }
 
 fn entity_names(m: &Memory) -> BTreeSet<String> {
     m.entities.iter().filter(|e| !e.trim().is_empty()).map(|e| e.to_lowercase()).collect()
+}
+
+/// Below this many eligible rows in a segment, vector scoring is exact: a
+/// scan is fast at that size and has perfect recall.
+const ANN_MIN_ROWS: usize = 4_096;
+/// When the caller can read less than this share of a segment, the
+/// approximate index would walk mostly past rows it must skip, so an exact
+/// scan of the eligible rows is used instead.
+const ANN_MIN_SHARE: f32 = 0.05;
+/// Upper bound on the approximate search's candidate list.
+const ANN_MAX_EF: usize = 4_096;
+
+/// Caller-supplied embeddings for one segment, normalised and stored flat,
+/// with an approximate index over them. All must share the first one's
+/// dimension; others are still scored exactly.
+struct Embeddings {
+    dim: usize,
+    data: Vec<f32>,
+    node_row: Vec<u32>,
+    row_node: HashMap<u32, u32>,
+    ann: Hnsw,
+}
+
+impl Embeddings {
+    fn catch_up(&mut self) -> usize {
+        let mut added = 0;
+        while self.ann.len() < self.node_row.len() {
+            self.ann.insert(&self.data, self.dim);
+            added += 1;
+        }
+        added
+    }
+}
+
+fn normalised(v: &[f32]) -> Option<Vec<f32>> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    (norm > 0.0 && norm.is_finite()).then(|| v.iter().map(|x| x / norm).collect())
+}
+
+impl Segment {
+    /// Add any rows written since the last call to the approximate indexes.
+    /// Writes stay fast because indexing happens here, on first use or in
+    /// `MemoryStore::build_index`, not on the write path.
+    fn catch_up(&mut self) -> usize {
+        let mut added = 0;
+        while self.hash_ann.len() < self.rows.len() {
+            self.hash_ann.insert(&self.vecs, HASH_DIM);
+            added += 1;
+        }
+        if let Some(emb) = self.emb.as_mut() {
+            added += emb.catch_up();
+        }
+        added
+    }
 }
 
 /// One segment as a particular caller sees it for a particular query.
@@ -371,8 +433,22 @@ impl MemoryStore {
                 for name in entity_names(&m) {
                     segment.entity_rows.entry(name).or_default().push(row);
                 }
-                if m.embedding.is_some() {
+                if let Some(embedding) = &m.embedding {
                     segment.with_embedding.push(row);
+                    if let Some(unit) = normalised(embedding) {
+                        let emb = segment.emb.get_or_insert_with(|| Embeddings {
+                            dim: unit.len(),
+                            data: Vec::new(),
+                            node_row: Vec::new(),
+                            row_node: HashMap::new(),
+                            ann: Hnsw::default(),
+                        });
+                        if emb.dim == unit.len() {
+                            emb.row_node.insert(row, emb.node_row.len() as u32);
+                            emb.node_row.push(row);
+                            emb.data.extend_from_slice(&unit);
+                        }
+                    }
                 }
                 self.location.insert(id, (at, row));
                 self.by_tenant.entry(m.tenant.clone()).or_default().push(id);
@@ -429,6 +505,12 @@ impl MemoryStore {
                         }
                         let start = row as usize * HASH_DIM;
                         segment.vecs[start..start + HASH_DIM].fill(0.0);
+                        if let Some(emb) = segment.emb.as_mut() {
+                            if let Some(node) = emb.row_node.get(&row) {
+                                let start = *node as usize * emb.dim;
+                                emb.data[start..start + emb.dim].fill(0.0);
+                            }
+                        }
                     }
                     if let Some(ids) = self.by_tenant.get_mut(&m.tenant) {
                         ids.retain(|x| *x != id);
@@ -815,13 +897,36 @@ impl MemoryStore {
         top_ids(scored, pool)
     }
 
+    /// Whether vector scoring for this view should use the approximate index.
+    fn use_ann(&self, view: &View, q: &Query) -> bool {
+        let total = self.segments[view.segment].rows.len().max(1);
+        !q.exact && view.rows.len() >= ANN_MIN_ROWS && view.rows.len() as f32 / total as f32 >= ANN_MIN_SHARE
+    }
+
+    /// Candidate list size for an approximate search: wider when the caller
+    /// can read only part of the segment, since skipped rows still take room.
+    fn ef_for(&self, view: &View, pool: usize) -> usize {
+        let share = view.rows.len() as f32 / self.segments[view.segment].rows.len().max(1) as f32;
+        ((pool.max(64) as f32 / share).ceil() as usize).clamp(pool, ANN_MAX_EF)
+    }
+
     fn rank_vector(&self, views: &[View], q: &Query, pool: usize) -> Vec<u64> {
         let mut scored: Vec<(u64, f32)> = Vec::new();
         match &q.embedding {
-            // Caller-supplied embeddings: compare against memories that have one.
+            // Caller-supplied embeddings.
             Some(query) => {
+                let unit = normalised(query);
                 for view in views {
                     let seg = &self.segments[view.segment];
+                    let indexed = seg.emb.as_ref().filter(|e| unit.as_ref().is_some_and(|u| u.len() == e.dim));
+                    if let (Some(emb), Some(unit), true) = (indexed, unit.as_ref(), self.use_ann(view, q)) {
+                        let accept = |node: u32| view.mask[emb.node_row[node as usize] as usize];
+                        let ef = self.ef_for(view, pool);
+                        for (node, sim) in emb.ann.search(unit, &emb.data, emb.dim, pool, ef, &accept) {
+                            scored.push((seg.rows[emb.node_row[node as usize] as usize].id, sim));
+                        }
+                        continue;
+                    }
                     for row in seg.with_embedding.iter().filter(|r| view.mask[**r as usize]) {
                         let id = seg.rows[*row as usize].id;
                         if let Some(e) = self.memories.get(&id).and_then(|m| m.embedding.as_ref()) {
@@ -835,6 +940,14 @@ impl MemoryStore {
                 let query = hash_embed(&q.text);
                 for view in views {
                     let seg = &self.segments[view.segment];
+                    if self.use_ann(view, q) {
+                        let accept = |row: u32| view.mask[row as usize];
+                        let ef = self.ef_for(view, pool);
+                        for (row, sim) in seg.hash_ann.search(&query, &seg.vecs, HASH_DIM, pool, ef, &accept) {
+                            scored.push((seg.rows[row as usize].id, sim));
+                        }
+                        continue;
+                    }
                     for row in &view.rows {
                         let start = *row as usize * HASH_DIM;
                         scored.push((seg.rows[*row as usize].id, dot(&query, &seg.vecs[start..start + HASH_DIM])));
@@ -935,6 +1048,12 @@ impl MemoryStore {
             return vec![];
         }
         let pool = (q.k * 4).max(32);
+        // Bring the approximate index up to date for the segments that will use it.
+        for view in &views {
+            if self.use_ann(view, q) {
+                self.segments[view.segment].catch_up();
+            }
+        }
 
         let mut rankings: [Vec<u64>; 4] = Default::default();
         let mut scored: Vec<(u64, f32)> = if q.text.trim().is_empty() && q.embedding.is_none() {
@@ -1168,6 +1287,30 @@ impl MemoryStore {
             self.emit(Event::Archive { id: *id })?;
         }
         Ok(SweepReport { expired: expired.len(), archived: fading.len() })
+    }
+
+    /// Add every memory not yet in the approximate vector indexes and return
+    /// how many were added. Recall does this on its own when it needs to; call
+    /// it after a bulk load so the first queries do not pay for it.
+    ///
+    /// Segments are independent, so they are indexed in parallel, one thread
+    /// per core.
+    pub fn build_index(&mut self) -> usize {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        // Largest segments first, dealt out in turn, so threads finish together.
+        let mut work: Vec<&mut Segment> = self.segments.iter_mut().collect();
+        work.sort_by_key(|seg| std::cmp::Reverse(seg.rows.len()));
+        let mut shares: Vec<Vec<&mut Segment>> = (0..threads).map(|_| Vec::new()).collect();
+        for (i, seg) in work.into_iter().enumerate() {
+            shares[i % threads].push(seg);
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = shares
+                .into_iter()
+                .map(|share| scope.spawn(move || share.into_iter().map(Segment::catch_up).sum::<usize>()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+        })
     }
 
     pub fn stats(&self) -> Stats {

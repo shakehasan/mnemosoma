@@ -566,3 +566,45 @@ fn a_recently_used_memory_does_not_outrank_a_better_match() {
     assert_eq!(s.recall(&a, &Query::text("what is Ana's diet"), later)[0].memory.content, "Ana's diet is vegetarian");
     assert_eq!(s.recall(&a, &Query::text("what is Ana's city"), later)[0].memory.content, "Ana's city is Lisbon");
 }
+
+#[test]
+fn approximate_vector_search_agrees_with_exact_and_respects_scopes() {
+    let mut s = store();
+    let ana = who("acme", "ana", "r1", "researcher");
+    let bo = who("acme", "bo", "r2", "researcher");
+    let team = Scope::Team("task-1".into());
+    // Deterministic pseudo-random embeddings, 32 dimensions.
+    let mut state = 99u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % 2001) as f32 / 1000.0 - 1.0
+    };
+    let mut vectors = Vec::new();
+    for i in 0..6_000 {
+        let v: Vec<f32> = (0..32).map(|_| next()).collect();
+        let (who, scope) = if i % 10 == 0 { (&ana, Scope::UserPrivate("ana".into())) } else { (&ana, team.clone()) };
+        let mut m = NewMemory::new(scope, MemoryKind::Semantic, format!("item {i}"));
+        m.embedding = Some(v.clone());
+        s.write(who, m, T0).unwrap();
+        vectors.push(v);
+    }
+    assert!(s.build_index() >= 6_000);
+
+    let mut agree = 0;
+    for v in vectors.iter().step_by(150) {
+        let mut q = Query::text("");
+        q.embedding = Some(v.iter().map(|x| x + 0.01).collect());
+        q.k = 10;
+        q.graph_hops = 0;
+        let approximate: Vec<u64> = s.recall(&bo, &q, T0).iter().map(|h| h.memory.id).collect();
+        q.exact = true;
+        let exact: Vec<u64> = s.recall(&bo, &q, T0).iter().map(|h| h.memory.id).collect();
+        agree += exact.iter().filter(|id| approximate.contains(id)).count();
+        // Bo cannot read Ana's private items, approximate or not.
+        assert!(s.recall(&bo, &q, T0).iter().all(|h| h.memory.scope == team));
+    }
+    let share = agree as f32 / (40 * 10) as f32;
+    assert!(share >= 0.9, "approximate top 10 matched exact for {share:.2}");
+}
