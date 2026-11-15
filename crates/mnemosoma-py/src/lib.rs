@@ -153,6 +153,10 @@ impl Store {
         dump(&report)
     }
 
+    fn build_index(&self, py: Python<'_>) -> PyResult<usize> {
+        self.run(py, |s| Ok(s.build_index()))
+    }
+
     fn stats(&self, py: Python<'_>) -> PyResult<String> {
         let stats = self.run(py, |s| Ok(s.stats()))?;
         dump(&stats)

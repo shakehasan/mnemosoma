@@ -159,6 +159,7 @@ class MemoryStore:
         min_trust: Trust = "standard",
         include_archived: bool = False,
         graph_hops: int = 1,
+        exact: bool = False,
         embedding: Sequence[float] | None = None,
         now: Moment | None = None,
     ) -> list[Hit]:
@@ -168,7 +169,9 @@ class MemoryStore:
         an agent reads a team blackboard or picks up a handoff. ``as_of`` answers
         from the facts that were true at that moment. Untrusted content is left
         out unless ``min_trust="untrusted"``. ``graph_hops`` is how far to follow
-        shared entities from the best matches; ``0`` turns that off.
+        shared entities from the best matches; ``0`` turns that off. Large
+        scopes use an approximate vector index; ``exact=True`` scores every
+        eligible memory instead.
 
         Each hit's ``why`` says which rankers chose it and who shared it.
         """
@@ -184,6 +187,7 @@ class MemoryStore:
             "min_trust": min_trust,
             "include_archived": include_archived,
             "graph_hops": graph_hops,
+            "exact": exact,
         }
         raw = self._core.recall(who.to_json(), json.dumps(query), to_ms(now))
         hits = [Hit.from_dict(h) for h in json.loads(raw)]
@@ -264,6 +268,14 @@ class MemoryStore:
         """Drop expired memories and archive faded episodes. Returns ``{"expired", "archived"}``."""
         return json.loads(self._core.sweep(to_ms(now)))
 
+    def build_index(self) -> int:
+        """Index every memory not yet in the approximate vector indexes, in parallel.
+
+        Recall does this by itself when it needs to. Call it after a bulk load
+        so the first queries do not pay for it. Returns how many were added.
+        """
+        return self._core.build_index()
+
     def stats(self) -> dict[str, int]:
         return json.loads(self._core.stats())
 
@@ -302,3 +314,4 @@ class AsyncMemoryStore:
     corroborate = _in_thread("corroborate")
     forget = _in_thread("forget")
     sweep = _in_thread("sweep")
+    build_index = _in_thread("build_index")

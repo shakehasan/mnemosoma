@@ -82,6 +82,9 @@ fn main() {
         written += 1;
     }
     let write_secs = started.elapsed().as_secs_f64();
+    let index_started = Instant::now();
+    let indexed = store.build_index();
+    let index_secs = index_started.elapsed().as_secs_f64();
 
     // Recalls: every hit is checked against the scope rules independently.
     let queries: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(2_000);
@@ -118,6 +121,7 @@ fn main() {
     println!("users / agents      {} / {} per tenant", users_per_tenant, agents_per_tenant);
     println!("write throughput    {:.0} per second", total as f64 / write_secs);
     println!("write p50 / p95     {:.4} / {:.4} ms", percentile(&write_ms, 0.5), percentile(&write_ms, 0.95));
+    println!("index build         {indexed} vectors in {index_secs:.1} s");
     println!("recall p50 / p95    {:.3} / {:.3} ms", percentile(&recall_ms, 0.5), percentile(&recall_ms, 0.95));
     println!("recalls / hits      {queries} / {returned}");
     println!("permission leaks    {leaks}");

@@ -177,3 +177,22 @@ def test_mcp_server_tools():
     # Another user's server sees nothing of Ana's.
     other = build_server(store, BO, write_scope=Scope.user("bo"))
     assert "No relevant memories" in str(asyncio.run(other.call_tool("recall", {"query": "where does ana work"})))
+
+
+def test_approximate_index_matches_exact_on_a_large_scope():
+    import random
+
+    rng = random.Random(3)
+    store = MemoryStore("k")
+    vectors = []
+    for i in range(5000):
+        v = [rng.uniform(-1, 1) for _ in range(16)]
+        vectors.append(v)
+        store.write(ANA, f"item {i}", scope=TEAM, embedding=v, now=T0)
+    assert store.build_index() >= 5000
+    agree = 0
+    for v in vectors[::250]:
+        approximate = {h.memory.id for h in store.recall(ANA, embedding=v, k=10, graph_hops=0, now=T0)}
+        exact = {h.memory.id for h in store.recall(ANA, embedding=v, k=10, graph_hops=0, exact=True, now=T0)}
+        agree += len(approximate & exact)
+    assert agree / (20 * 10) >= 0.9
