@@ -7,6 +7,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Build and test wheels, without publishing, when packaging changes.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "pyproject.toml"
+      - "Cargo.toml"
+      - "crates/*/Cargo.toml"
   workflow_dispatch:
 
 permissions:
