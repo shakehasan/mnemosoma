@@ -510,7 +510,7 @@ How to read this:
 
 ## Capacity
 
-Measured with [`crates/mnemosoma-core/examples/load.rs`](crates/mnemosoma-core/examples/load.rs) on a laptop: Intel Core i7-1260P (12 cores), 16 GB RAM, Windows 11, release build, in-memory store, built-in embedder. Writes and recalls run on one thread; the index build uses all cores. Each tenant has 100 users, 20 agents in 4 roles and 10 teams. Every returned memory is re-checked against the scope rules.
+Measured with [`crates/mnemosoma-core/examples/load.rs`](crates/mnemosoma-core/examples/load.rs) on a laptop: Intel Core i7-1260P (12 cores), 16 GB RAM, Windows 11, on mains power, release build, in-memory store, built-in embedder. On battery the same runs are roughly two to three times slower. Writes and recalls run on one thread; the index build uses all cores. Each tenant has 100 users, 20 agents in 4 roles and 10 teams. Every returned memory is re-checked against the scope rules.
 
 | Memories | Tenants | Readable per caller | Writes per second | Index build | Recall p50 | Recall p95 | Permission leaks |
 |---|---|---|---|---|---|---|---|
