@@ -2,7 +2,7 @@
 //! and the read and write paths.
 
 use crate::identity::{default_roles, Grant, Identity, RolePolicy, Scope, ScopeKind};
-use crate::index::{bm25, cosine, hash_embed, rrf, sort_desc, tokenize};
+use crate::index::{cosine, dot, hash_embed, rrf, sort_desc, tokenize, top_ids, HASH_DIM};
 use crate::memory::{Assertion, Memory, MemoryKind, NewMemory, Trust};
 use crate::provenance;
 use serde::{Deserialize, Serialize};
@@ -156,16 +156,75 @@ enum Event {
 
 type ChainKey = (String, Scope, String);
 
+/// Stands for "no end" in the time columns, so filters are plain comparisons.
+const OPEN: i64 = i64::MAX;
+
+/// The fields recall filters on, kept together so a scan stays in cache.
+struct Row {
+    id: u64,
+    valid_from: i64,
+    valid_to: i64,
+    expires_at: i64,
+    recorded_at: i64,
+    doc_len: u32,
+    trust: Trust,
+    kind: MemoryKind,
+    live: bool,
+    archived: bool,
+    /// Not derived from anything, so scope access alone decides readability.
+    plain: bool,
+}
+
+/// All memories of one (tenant, scope), stored by column. Recall opens only
+/// the segments the caller can read, so its cost follows what the caller may
+/// see and not the size of the store.
+#[derive(Default)]
+struct Segment {
+    rows: Vec<Row>,
+    /// One built-in embedding per row, `HASH_DIM` floats each.
+    vecs: Vec<f32>,
+    /// Term to (row, term frequency), rows ascending.
+    postings: HashMap<String, Vec<(u32, u32)>>,
+    with_entities: Vec<u32>,
+    with_embedding: Vec<u32>,
+}
+
+/// One segment as a particular caller sees it for a particular query.
+struct View {
+    segment: usize,
+    mask: Vec<bool>,
+    rows: Vec<u32>,
+}
+
+fn index_text(m: &Memory) -> String {
+    let mut text = m.content.clone();
+    for e in &m.entities {
+        text.push(' ');
+        text.push_str(e);
+    }
+    text
+}
+
+fn term_counts(mut tokens: Vec<String>) -> Vec<(String, u32)> {
+    tokens.sort_unstable();
+    let mut counts: Vec<(String, u32)> = Vec::new();
+    for token in tokens {
+        match counts.last_mut() {
+            Some((last, n)) if *last == token => *n += 1,
+            _ => counts.push((token, 1)),
+        }
+    }
+    counts
+}
+
 pub struct MemoryStore {
     cfg: StoreConfig,
     memories: BTreeMap<u64, Memory>,
-    tokens: HashMap<u64, Vec<String>>,
-    hash_vecs: HashMap<u64, Vec<f32>>,
     by_tenant: HashMap<String, Vec<u64>>,
-    /// Memories grouped by (tenant, scope). Recall walks only the groups the
-    /// caller can read, so its cost follows what the caller may see and not
-    /// the size of the tenant.
-    by_scope: HashMap<(String, Scope), Vec<u64>>,
+    segments: Vec<Segment>,
+    segment_of: HashMap<(String, Scope), usize>,
+    /// Memory id to (segment, row).
+    location: HashMap<u64, (usize, u32)>,
     /// Every memory sharing a (tenant, scope, subject), for supersession.
     chains: HashMap<ChainKey, Vec<u64>>,
     grants: Vec<Grant>,
@@ -182,10 +241,10 @@ impl MemoryStore {
         Self {
             cfg,
             memories: BTreeMap::new(),
-            tokens: HashMap::new(),
-            hash_vecs: HashMap::new(),
             by_tenant: HashMap::new(),
-            by_scope: HashMap::new(),
+            segments: vec![],
+            segment_of: HashMap::new(),
+            location: HashMap::new(),
             chains: HashMap::new(),
             grants: vec![],
             next_id: 1,
@@ -247,15 +306,44 @@ impl MemoryStore {
                 let m = *memory;
                 let id = m.id;
                 self.next_id = self.next_id.max(id + 1);
-                let mut text = m.content.clone();
-                for e in &m.entities {
-                    text.push(' ');
-                    text.push_str(e);
+                let text = index_text(&m);
+                let tokens = tokenize(&text);
+                let key = (m.tenant.clone(), m.scope.clone());
+                let at = match self.segment_of.get(&key) {
+                    Some(at) => *at,
+                    None => {
+                        self.segments.push(Segment::default());
+                        self.segment_of.insert(key, self.segments.len() - 1);
+                        self.segments.len() - 1
+                    }
+                };
+                let segment = &mut self.segments[at];
+                let row = segment.rows.len() as u32;
+                segment.rows.push(Row {
+                    id,
+                    valid_from: m.valid_from,
+                    valid_to: m.valid_to.unwrap_or(OPEN),
+                    expires_at: m.expires_at.unwrap_or(OPEN),
+                    recorded_at: m.recorded_at,
+                    doc_len: tokens.len() as u32,
+                    trust: m.trust,
+                    kind: m.kind,
+                    live: true,
+                    archived: m.archived,
+                    plain: m.derived_from.is_empty(),
+                });
+                segment.vecs.extend_from_slice(&hash_embed(&text));
+                for (term, count) in term_counts(tokens) {
+                    segment.postings.entry(term).or_default().push((row, count));
                 }
-                self.tokens.insert(id, tokenize(&text));
-                self.hash_vecs.insert(id, hash_embed(&text));
+                if !m.entities.is_empty() {
+                    segment.with_entities.push(row);
+                }
+                if m.embedding.is_some() {
+                    segment.with_embedding.push(row);
+                }
+                self.location.insert(id, (at, row));
                 self.by_tenant.entry(m.tenant.clone()).or_default().push(id);
-                self.by_scope.entry((m.tenant.clone(), m.scope.clone())).or_default().push(id);
                 if let Some(subject) = &m.subject {
                     self.chains
                         .entry((m.tenant.clone(), m.scope.clone(), subject.clone()))
@@ -269,6 +357,9 @@ impl MemoryStore {
                     m.valid_to = Some(at);
                     m.superseded_by = Some(new);
                 }
+                if let Some(row) = self.row_mut(old) {
+                    row.valid_to = at;
+                }
             }
             Event::Grant { grant } => {
                 self.next_grant_id = self.next_grant_id.max(grant.id + 1);
@@ -281,17 +372,26 @@ impl MemoryStore {
             }
             Event::Forget { id } => {
                 if let Some(m) = self.memories.remove(&id) {
-                    self.tokens.remove(&id);
-                    self.hash_vecs.remove(&id);
+                    // Remove every trace from the indexes, not only the record:
+                    // the words it contained and its embedding go as well.
+                    if let Some((at, row)) = self.location.remove(&id) {
+                        let segment = &mut self.segments[at];
+                        segment.rows[row as usize].live = false;
+                        for (term, _) in term_counts(tokenize(&index_text(&m))) {
+                            if let Some(list) = segment.postings.get_mut(&term) {
+                                if let Ok(i) = list.binary_search_by_key(&row, |entry| entry.0) {
+                                    list.remove(i);
+                                }
+                                if list.is_empty() {
+                                    segment.postings.remove(&term);
+                                }
+                            }
+                        }
+                        let start = row as usize * HASH_DIM;
+                        segment.vecs[start..start + HASH_DIM].fill(0.0);
+                    }
                     if let Some(ids) = self.by_tenant.get_mut(&m.tenant) {
                         ids.retain(|x| *x != id);
-                    }
-                    let group = (m.tenant.clone(), m.scope.clone());
-                    if let Some(ids) = self.by_scope.get_mut(&group) {
-                        ids.retain(|x| *x != id);
-                        if ids.is_empty() {
-                            self.by_scope.remove(&group);
-                        }
                     }
                     if let Some(subject) = m.subject {
                         let key = (m.tenant, m.scope, subject);
@@ -315,8 +415,16 @@ impl MemoryStore {
                 if let Some(m) = self.memories.get_mut(&id) {
                     m.archived = true;
                 }
+                if let Some(row) = self.row_mut(id) {
+                    row.archived = true;
+                }
             }
         }
+    }
+
+    fn row_mut(&mut self, id: u64) -> Option<&mut Row> {
+        let (at, row) = *self.location.get(&id)?;
+        self.segments.get_mut(at)?.rows.get_mut(row as usize)
     }
 
     /// Rewrite the log from current state, so that forgotten memories are
@@ -426,6 +534,35 @@ impl MemoryStore {
             }
         }
         scopes
+    }
+
+    /// How a caller may read a scope: `Some(true)` for all of it,
+    /// `Some(false)` when each memory must be checked (a tagged grant), and
+    /// `None` for no access.
+    fn scope_access(&self, who: &Identity, scope: &Scope, now: i64) -> Option<bool> {
+        let policy = self.policy(who)?;
+        if !policy.read.contains(&scope.kind()) {
+            return None;
+        }
+        match scope {
+            Scope::AgentPrivate(agent) => (*agent == who.agent).then_some(true),
+            Scope::Role(role) => (*role == who.role).then_some(true),
+            Scope::Team(team) => (who.team.as_ref() == Some(team)).then_some(true),
+            Scope::Tenant => Some(true),
+            Scope::UserPrivate(user) if *user == who.user => Some(true),
+            Scope::UserPrivate(user) => {
+                let mut tagged = false;
+                for g in &self.grants {
+                    if g.tenant == who.tenant && g.grantor == *user && g.grantee == who.user && g.active(now) {
+                        if g.tag.is_none() {
+                            return Some(true);
+                        }
+                        tagged = true;
+                    }
+                }
+                tagged.then_some(false)
+            }
+        }
     }
 
     fn can_write(&self, who: &Identity, scope: &Scope) -> bool {
@@ -546,87 +683,180 @@ impl MemoryStore {
         0.5f32.powf(idle / self.cfg.half_life_ms.max(1) as f32)
     }
 
+    /// The rows of each readable segment that pass every filter for this
+    /// caller and query, with their count and total length in tokens.
+    fn eligible(&self, who: &Identity, q: &Query, now: i64) -> (Vec<View>, usize, u64) {
+        let at = q.as_of.unwrap_or(now);
+        let mut memo = HashMap::new();
+        let (mut views, mut count, mut length) = (Vec::new(), 0usize, 0u64);
+        for scope in self.readable_scopes(who, now) {
+            if !q.scopes.is_empty() && !q.scopes.contains(&scope.kind()) {
+                continue;
+            }
+            let Some(whole_scope) = self.scope_access(who, &scope, now) else { continue };
+            let Some(&segment) = self.segment_of.get(&(who.tenant.clone(), scope)) else { continue };
+            let seg = &self.segments[segment];
+            let mut mask = vec![false; seg.rows.len()];
+            let mut rows = Vec::new();
+            for (i, r) in seg.rows.iter().enumerate() {
+                if !r.live
+                    || (r.archived && !q.include_archived)
+                    || r.expires_at <= now
+                    || r.valid_from > at
+                    || r.valid_to <= at
+                    || r.trust < q.min_trust
+                    || (!q.kinds.is_empty() && !q.kinds.contains(&r.kind))
+                {
+                    continue;
+                }
+                // Derived memories and tagged grants need the full check.
+                if !(whole_scope && r.plain) && !self.can_read_deep(who, r.id, now, &mut memo) {
+                    continue;
+                }
+                mask[i] = true;
+                rows.push(i as u32);
+                length += u64::from(r.doc_len);
+            }
+            count += rows.len();
+            if !rows.is_empty() {
+                views.push(View { segment, mask, rows });
+            }
+        }
+        (views, count, length)
+    }
+
+    /// Okapi BM25 through the posting lists. Document counts and lengths come
+    /// from the caller's eligible rows only, so scores reveal nothing about
+    /// memories the caller cannot read.
+    fn rank_keyword(&self, views: &[View], query: &[String], count: usize, length: u64, pool: usize) -> Vec<u64> {
+        const K1: f32 = 1.2;
+        const B: f32 = 0.75;
+        let mut terms: Vec<&String> = query.iter().collect();
+        terms.sort();
+        terms.dedup();
+        let n = count as f32;
+        let avg_len = (length as f32 / n).max(1.0);
+        let mut scores: Vec<Vec<f32>> = views.iter().map(|v| vec![0.0; v.mask.len()]).collect();
+        let mut touched: Vec<(usize, u32)> = Vec::new();
+        for term in terms {
+            let lists: Vec<(usize, &Vec<(u32, u32)>)> = views
+                .iter()
+                .enumerate()
+                .filter_map(|(v, view)| Some((v, self.segments[view.segment].postings.get(term.as_str())?)))
+                .collect();
+            let df: usize = lists
+                .iter()
+                .map(|(v, list)| list.iter().filter(|entry| views[*v].mask[entry.0 as usize]).count())
+                .sum();
+            if df == 0 {
+                continue;
+            }
+            let idf = (1.0 + (n - df as f32 + 0.5) / (df as f32 + 0.5)).ln();
+            for (v, list) in lists {
+                let rows = &self.segments[views[v].segment].rows;
+                for (row, tf) in list {
+                    let r = *row as usize;
+                    if !views[v].mask[r] {
+                        continue;
+                    }
+                    let tf = *tf as f32;
+                    let len_norm = K1 * (1.0 - B + B * rows[r].doc_len as f32 / avg_len);
+                    if scores[v][r] == 0.0 {
+                        touched.push((v, *row));
+                    }
+                    scores[v][r] += idf * (tf * (K1 + 1.0)) / (tf + len_norm);
+                }
+            }
+        }
+        let scored = touched
+            .into_iter()
+            .map(|(v, row)| (self.segments[views[v].segment].rows[row as usize].id, scores[v][row as usize]))
+            .collect();
+        top_ids(scored, pool)
+    }
+
+    fn rank_vector(&self, views: &[View], q: &Query, pool: usize) -> Vec<u64> {
+        let mut scored: Vec<(u64, f32)> = Vec::new();
+        match &q.embedding {
+            // Caller-supplied embeddings: compare against memories that have one.
+            Some(query) => {
+                for view in views {
+                    let seg = &self.segments[view.segment];
+                    for row in seg.with_embedding.iter().filter(|r| view.mask[**r as usize]) {
+                        let id = seg.rows[*row as usize].id;
+                        if let Some(e) = self.memories.get(&id).and_then(|m| m.embedding.as_ref()) {
+                            scored.push((id, cosine(query, e)));
+                        }
+                    }
+                }
+            }
+            // Built-in embeddings are unit length, so the dot product is the cosine.
+            None => {
+                let query = hash_embed(&q.text);
+                for view in views {
+                    let seg = &self.segments[view.segment];
+                    for row in &view.rows {
+                        let start = *row as usize * HASH_DIM;
+                        scored.push((seg.rows[*row as usize].id, dot(&query, &seg.vecs[start..start + HASH_DIM])));
+                    }
+                }
+            }
+        }
+        scored.retain(|entry| entry.1 > 0.0);
+        top_ids(scored, pool)
+    }
+
+    fn rank_entity(&self, views: &[View], text: &str, pool: usize) -> Vec<u64> {
+        let lowered = text.to_lowercase();
+        let mut scored: Vec<(u64, f32)> = Vec::new();
+        for view in views {
+            let seg = &self.segments[view.segment];
+            for row in seg.with_entities.iter().filter(|r| view.mask[**r as usize]) {
+                let id = seg.rows[*row as usize].id;
+                let Some(m) = self.memories.get(&id) else { continue };
+                let named = m
+                    .entities
+                    .iter()
+                    .filter(|e| !e.is_empty() && lowered.contains(&e.to_lowercase()))
+                    .count();
+                if named > 0 {
+                    scored.push((id, named as f32));
+                }
+            }
+        }
+        top_ids(scored, pool)
+    }
+
     /// Recall memories for a caller. Filters run before ranking, so a memory
     /// the caller may not read never reaches a ranker.
     pub fn recall(&mut self, who: &Identity, q: &Query, now: i64) -> Vec<Hit> {
-        let at = q.as_of.unwrap_or(now);
-        let mut memo = HashMap::new();
-        let mut candidates: Vec<u64> = Vec::new();
-        let readable = self.readable_scopes(who, now);
-        let groups = readable.into_iter().filter_map(|scope| self.by_scope.get(&(who.tenant.clone(), scope)));
-        for id in groups.flatten() {
-            let Some(m) = self.memories.get(id) else { continue };
-            if (m.archived && !q.include_archived)
-                || m.expires_at.is_some_and(|e| e <= now)
-                || m.valid_from > at
-                || m.valid_to.is_some_and(|end| end <= at)
-                || (!q.kinds.is_empty() && !q.kinds.contains(&m.kind))
-                || (!q.scopes.is_empty() && !q.scopes.contains(&m.scope.kind()))
-                || m.trust < q.min_trust
-            {
-                continue;
-            }
-            if self.can_read_deep(who, *id, now, &mut memo) {
-                candidates.push(*id);
-            }
-        }
-        if candidates.is_empty() || q.k == 0 {
+        if q.k == 0 {
             return vec![];
         }
+        let (views, count, length) = self.eligible(who, q, now);
+        if count == 0 {
+            return vec![];
+        }
+        let pool = (q.k * 4).max(32);
 
         let mut scored: Vec<(u64, f32)> = if q.text.trim().is_empty() && q.embedding.is_none() {
             // No query: newest first. Used to read a blackboard or a handoff.
-            let mut newest: Vec<(i64, u64)> =
-                candidates.iter().map(|id| (self.memories[id].recorded_at, *id)).collect();
+            let mut newest: Vec<(i64, u64)> = Vec::with_capacity(count);
+            for view in &views {
+                let rows = &self.segments[view.segment].rows;
+                newest.extend(view.rows.iter().map(|r| (rows[*r as usize].recorded_at, rows[*r as usize].id)));
+            }
             newest.sort_unstable_by(|a, b| b.cmp(a));
+            newest.truncate(pool);
             newest
                 .into_iter()
                 .enumerate()
                 .map(|(rank, (_, id))| (id, 1.0 / (rank as f32 + 1.0)))
                 .collect()
         } else {
-            let pool = (q.k * 4).max(32);
-            let ids = |ranked: Vec<(u64, f32)>| ranked.into_iter().take(pool).map(|r| r.0).collect();
-
-            let query_tokens = tokenize(&q.text);
-            let docs: Vec<(u64, &[String])> = candidates
-                .iter()
-                .map(|id| (*id, self.tokens[id].as_slice()))
-                .collect();
-            let keyword: Vec<u64> = ids(bm25(&query_tokens, &docs));
-
-            let mut by_vector: Vec<(u64, f32)> = match &q.embedding {
-                Some(qe) => candidates
-                    .iter()
-                    .filter_map(|id| {
-                        let e = self.memories[id].embedding.as_ref()?;
-                        Some((*id, cosine(qe, e)))
-                    })
-                    .collect(),
-                None => {
-                    let qe = hash_embed(&q.text);
-                    candidates.iter().map(|id| (*id, cosine(&qe, &self.hash_vecs[id]))).collect()
-                }
-            };
-            by_vector.retain(|r| r.1 > 0.0);
-            sort_desc(&mut by_vector);
-            let vector: Vec<u64> = ids(by_vector);
-
-            let lowered = q.text.to_lowercase();
-            let mut by_entity: Vec<(u64, f32)> = candidates
-                .iter()
-                .filter_map(|id| {
-                    let n = self.memories[id]
-                        .entities
-                        .iter()
-                        .filter(|e| !e.is_empty() && lowered.contains(&e.to_lowercase()))
-                        .count();
-                    (n > 0).then_some((*id, n as f32))
-                })
-                .collect();
-            sort_desc(&mut by_entity);
-            let entity: Vec<u64> = ids(by_entity);
-
+            let keyword = self.rank_keyword(&views, &tokenize(&q.text), count, length, pool);
+            let vector = self.rank_vector(&views, q, pool);
+            let entity = self.rank_entity(&views, &q.text, pool);
             rrf(&[keyword, vector, entity])
                 .into_iter()
                 .map(|(id, fused)| {

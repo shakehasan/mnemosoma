@@ -127,7 +127,7 @@ Three paths run through the engine.
 
 **Write path.** Check the caller's role, cap the trust level, sign the record, append it to the log, index it. No model is called, so a write never waits on a network. In memory it takes about a hundredth of a millisecond.
 
-**Read path.** Filters run first: tenant, scope, role policy, grants, valid time and trust. Only what survives is ranked. Three rankers score the survivors: BM25 keywords, vector similarity and entity matches. Their ranks are fused with reciprocal rank fusion, weighted by salience and trust, and packed into the caller's token budget.
+**Read path.** The engine opens only the segments the caller can read, one per scope. Filters run first: role policy, grants, valid time and trust. Only what survives is ranked. Three rankers score the survivors: BM25 keywords, vector similarity and entity matches. Their ranks are fused with reciprocal rank fusion, weighted by salience and trust, and packed into the caller's token budget.
 
 **Consolidation path.** A background pass reads new episodes, asks an extractor for the durable facts in them, and writes those facts back linked to their sources. This is the only place a model is involved, and it is off the hot path.
 
@@ -136,7 +136,7 @@ Three paths run through the engine.
 The engine does the work that runs on every single agent step, and that work is CPU-bound: walking scopes, checking grants, scoring candidates and verifying signatures. Three things follow from writing it in Rust.
 
 - **Many agents at once.** Python releases its interpreter lock for every engine call, so agents on different threads do not queue behind one another.
-- **Predictable latency.** No garbage collector pauses in the recall path. The measured numbers are under [Capacity](#capacity).
+- **Predictable latency.** No garbage collector pauses in the recall path, and memory laid out by column so filters and scoring stay in cache. The measured numbers are under [Capacity](#capacity).
 - **One artifact.** The engine compiles into the Python wheel. There is no server to run and no database to install.
 
 Python does everything else: the API you call, the LangChain and LangGraph integration, and the consolidation logic that talks to models.
@@ -312,10 +312,11 @@ store = MemoryStore("change-me", embedder=OllamaEmbeddings(model="nomic-embed-te
 
 Measured with [`crates/mnemosoma-core/examples/load.rs`](crates/mnemosoma-core/examples/load.rs) on a laptop: Intel Core i7-1260P, 16 GB RAM, Windows 11, release build, one thread, in-memory store, built-in embedder. Each tenant has 100 users, 20 agents in 4 roles and 10 teams. Every returned memory is re-checked against the scope rules.
 
-| Memories | Tenants | Writes per second | Write p95 | Recall p50 | Recall p95 | Permission leaks |
+| Memories | Tenants | Readable per caller | Writes per second | Recall p50 | Recall p95 | Permission leaks |
 |---|---|---|---|---|---|---|
-| 100,000 | 10 | 62,000 | 0.025 ms | 2.1 ms | 2.6 ms | 0 of 16,000 hits |
-| 1,000,000 | 100 | 55,000 | 0.026 ms | 3.3 ms | 4.2 ms | 0 of 16,000 hits |
+| 100,000 | 10 | about 750 | 73,000 | 0.12 ms | 0.16 ms | 0 of 16,000 hits |
+| 1,000,000 | 100 | about 750 | 46,000 | 0.17 ms | 0.22 ms | 0 of 16,000 hits |
+| 1,000,000 | 1 | about 75,000 | 59,000 | 8.6 ms | 12.0 ms | 0 of 4,000 hits |
 
 Run it yourself:
 
@@ -325,8 +326,9 @@ cargo run --release -p mnemosoma-core --example load -- 1000000 100
 
 What these numbers do and do not show:
 
-- Recall cost follows the number of memories the caller is allowed to read, not the size of the store. In the runs above each caller could read under a thousand memories.
-- Scoring is exact, with no approximate index yet. A run with one million memories in a single tenant, where each caller could read tens of thousands, did not finish 2,000 recalls in four minutes. That is more than 120 ms per recall, and it is the main thing the roadmap addresses.
+- Recall cost follows the number of memories the caller is allowed to read, not the size of the store. The first two rows hold the same readable set while the store grows tenfold, and recall time barely moves.
+- The third row is the hard case: one tenant, with each caller able to read about 75,000 memories. Memories are stored by column in one segment per scope. Keyword ranking goes through posting lists, and vector ranking is an exact scan over the readable rows.
+- Vector scoring is still exact, with no approximate index. Recall time will keep growing in step with the readable set, so a caller who can read millions of memories needs the approximate index on the roadmap.
 - The store is one process. Writers take turns behind one lock; at these write speeds that was not the bottleneck, but multi-threaded throughput has not been measured.
 - Durability is an append-only file with no fsync per write. Server mode and Postgres are not built.
 
@@ -334,7 +336,7 @@ What these numbers do and do not show:
 
 | Area | Built and tested | Planned |
 |---|---|---|
-| Engine | Scopes, role policies, grants, taint, bi-temporal chains, signed log, decay, TTL, erasure | Approximate vector index, inverted keyword index, sharding |
+| Engine | Scopes, role policies, grants, taint, bi-temporal chains, signed log, decay, TTL, erasure, columnar segments, inverted keyword index | Approximate vector index, sharding |
 | Retrieval | BM25, vector, entity match, rank fusion, token budget, point-in-time | Graph traversal over entities, learned reranker |
 | Python | Typed SDK, pluggable embedder, consolidator | Async API |
 | Integrations | LangChain retriever and tools, LangGraph example, optional LangSmith tracing | LangGraph `BaseStore` adapter, MCP server |
