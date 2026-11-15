@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mnemosoma"
+version = "0.1.0"
+description = "Memory for multi-agent, multi-user systems: permission-aware, bi-temporal, signed."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["agents", "memory", "multi-agent", "langchain", "langgraph", "rust"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=1.0", "langgraph>=1.0"]
+tracing = ["langsmith>=0.4"]
+dev = ["pytest>=8", "langchain-core>=1.0", "langgraph>=1.0", "langsmith>=0.4"]
+
+[project.urls]
+Repository = "https://github.com/shakehasan/mnemosoma"
+
+[tool.maturin]
+manifest-path = "crates/mnemosoma-py/Cargo.toml"
+python-source = "python"
+module-name = "mnemosoma._core"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

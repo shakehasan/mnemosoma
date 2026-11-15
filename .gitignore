@@ -1,0 +1,23 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.venv/
+venv/
+.pytest_cache/
+dist/
+*.egg-info/
+
+# Local memory logs
+*.compacting
+/memory.log
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Rust tests
+        run: cargo test -p mnemosoma-core
+
+      - name: Load benchmark with leak check
+        run: cargo run --release -p mnemosoma-core --example load -- 50000 10
+
+      - name: Build the Python package
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ -f .venv/Scripts/activate ]; then source .venv/Scripts/activate; else source .venv/bin/activate; fi
+          pip install maturin pytest "langchain-core>=1.0" "langgraph>=1.0" "langsmith>=0.4"
+          maturin develop --release
+          pytest -q
+          python examples/team_graph.py
