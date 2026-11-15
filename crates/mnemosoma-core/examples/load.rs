@@ -3,7 +3,8 @@
 //!
 //!     cargo run --release -p mnemosoma-core --example load -- 100000
 //!
-//! Arguments: total memories (default 100000), tenants (default 10).
+//! Arguments: total memories (default 100000), tenants (default 10),
+//! recalls (default 2000).
 
 use mnemosoma_core::*;
 use std::time::Instant;
@@ -83,7 +84,7 @@ fn main() {
     let write_secs = started.elapsed().as_secs_f64();
 
     // Recalls: every hit is checked against the scope rules independently.
-    let queries = 2_000;
+    let queries: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(2_000);
     let mut recall_ms = Vec::with_capacity(queries);
     let mut returned = 0usize;
     let mut leaks = 0usize;

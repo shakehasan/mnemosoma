@@ -1,5 +1,5 @@
-//! Ranking primitives: tokenizer, BM25, a dependency-free hashing embedder,
-//! cosine similarity and reciprocal rank fusion.
+//! Ranking primitives: tokenizer, a dependency-free hashing embedder,
+//! similarity functions, top-n selection and reciprocal rank fusion.
 
 use std::collections::HashMap;
 
@@ -66,56 +66,31 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Okapi BM25 over the given documents. Returns matches only, best first.
-pub fn bm25(query: &[String], docs: &[(u64, &[String])]) -> Vec<(u64, f32)> {
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-    if docs.is_empty() || query.is_empty() {
+/// Dot product, written so the compiler can vectorise it.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut lanes = [0f32; 8];
+    let (a8, b8) = (a.chunks_exact(8), b.chunks_exact(8));
+    let tail: f32 = a8.remainder().iter().zip(b8.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in a8.zip(b8) {
+        for i in 0..8 {
+            lanes[i] += x[i] * y[i];
+        }
+    }
+    lanes.iter().sum::<f32>() + tail
+}
+
+/// The ids of the `n` best-scoring entries, best first.
+pub fn top_ids(mut scored: Vec<(u64, f32)>, n: usize) -> Vec<u64> {
+    let order = |a: &(u64, f32), b: &(u64, f32)| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0));
+    if n == 0 {
         return vec![];
     }
-    let mut terms: Vec<&String> = query.iter().collect();
-    terms.sort();
-    terms.dedup();
-
-    let n = docs.len() as f32;
-    let avg_len = docs.iter().map(|d| d.1.len()).sum::<usize>() as f32 / n;
-    let mut df = vec![0u32; terms.len()];
-    let mut tfs: Vec<Vec<u32>> = Vec::with_capacity(docs.len());
-    for (_, toks) in docs {
-        let mut tf = vec![0u32; terms.len()];
-        for t in toks.iter() {
-            if let Ok(i) = terms.binary_search(&t) {
-                tf[i] += 1;
-            }
-        }
-        for (i, c) in tf.iter().enumerate() {
-            if *c > 0 {
-                df[i] += 1;
-            }
-        }
-        tfs.push(tf);
+    if scored.len() > n {
+        scored.select_nth_unstable_by(n - 1, order);
+        scored.truncate(n);
     }
-    let idf: Vec<f32> = df
-        .iter()
-        .map(|d| (1.0 + (n - *d as f32 + 0.5) / (*d as f32 + 0.5)).ln())
-        .collect();
-
-    let mut out: Vec<(u64, f32)> = docs
-        .iter()
-        .zip(&tfs)
-        .filter_map(|((id, toks), tf)| {
-            let len_norm = K1 * (1.0 - B + B * toks.len() as f32 / avg_len.max(1.0));
-            let score: f32 = tf
-                .iter()
-                .zip(&idf)
-                .filter(|(c, _)| **c > 0)
-                .map(|(c, w)| w * (*c as f32 * (K1 + 1.0)) / (*c as f32 + len_norm))
-                .sum();
-            (score > 0.0).then_some((*id, score))
-        })
-        .collect();
-    sort_desc(&mut out);
-    out
+    scored.sort_by(order);
+    scored.into_iter().map(|entry| entry.0).collect()
 }
 
 pub fn sort_desc(v: &mut [(u64, f32)]) {

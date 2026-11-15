@@ -155,7 +155,11 @@ class Hit:
     score: float
     established: bool
     """False for an agent's inference that nobody has corroborated yet."""
+    why: dict[str, Any] = field(default_factory=dict)
+    """Why it was returned: ``keyword_rank``, ``vector_rank``, ``entity_rank`` and
+    ``graph_rank`` (1 is best, ``None`` if that ranker did not pick it), and
+    ``shared_by`` when another user shared it."""
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Hit:
-        return cls(Memory.from_dict(d["memory"]), d["score"], d["established"])
+        return cls(Memory.from_dict(d["memory"]), d["score"], d["established"], d.get("why", {}))
