@@ -12,6 +12,7 @@ pub mod index;
 pub mod memory;
 pub mod provenance;
 pub mod store;
+pub mod text;
 
 pub use ann::HnswParams;
 pub use config::Tuning;

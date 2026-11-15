@@ -127,7 +127,7 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 
 **Why.** It makes the store work with no downloads, no API key and no GPU, which matters for tests, CI and first use. It tolerates small spelling differences.
 
-**Cost.** It matches spelling, not meaning. On LongMemEval it finds an answer-bearing session in the top ten for 93.6% of questions overall and for 73.3% of preference questions, which depend on meaning. Semantic recall needs a real embedding model.
+**Cost.** It matches spelling, not meaning. On LongMemEval it finds an answer-bearing session in the top ten for 97.2% of questions overall and for 86.7% of preference questions, which depend on meaning; at the first result those figures are 78.9% and 33.3%. Semantic recall needs a real embedding model.
 
 ## 13. Every parameter is a named setting
 
@@ -143,5 +143,5 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 - **Start-up replays the log.** No snapshots.
 - **Durability.** Appends are not fsynced individually.
 - **Retrieval only.** End-to-end answer accuracy with a reader model has not been measured.
-- **English-centric defaults.** The stopword list is English; stemming supports other languages by setting.
+- **English-centric defaults.** Stemming and stopword removal default to English. Stemming supports seventeen other languages by setting; the stopword list is English only and should be turned off for other languages.
 - **Entities are not extracted.** Graph expansion needs them supplied.

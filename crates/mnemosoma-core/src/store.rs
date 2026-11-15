@@ -4,12 +4,13 @@
 use crate::ann::Hnsw;
 use crate::config::Tuning;
 use crate::identity::{default_roles, Grant, Identity, RolePolicy, Scope, ScopeKind};
-use crate::index::{cosine, dot, hash_embed, rrf, sort_desc, tokenize, top_ids, HASH_DIM};
+use crate::index::{cosine, dot, hash_embed, rrf, sort_desc, top_ids, HASH_DIM};
 use crate::memory::{
     Assertion, Memory, MemoryKind, NewMemory, Trust, APPROVED_PREFIX,
     DEFAULT_REQUIRED_CORROBORATIONS,
 };
 use crate::provenance;
+use crate::text::Tokenizer;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
@@ -354,6 +355,7 @@ fn term_counts(mut tokens: Vec<String>) -> Vec<(String, u32)> {
 
 pub struct MemoryStore {
     cfg: StoreConfig,
+    tokenizer: Tokenizer,
     memories: BTreeMap<u64, Memory>,
     by_tenant: HashMap<String, Vec<u64>>,
     segments: Vec<Segment>,
@@ -372,9 +374,21 @@ pub struct MemoryStore {
 
 impl MemoryStore {
     /// An in-memory store with no persistence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cfg` names a stemming language that does not exist. Call
+    /// [`StoreConfig::validate`] first to get that as an error instead.
+    #[must_use]
     pub fn in_memory(cfg: StoreConfig) -> Self {
+        let tokenizer = Tokenizer::new(
+            cfg.tuning.stem_language.as_deref(),
+            cfg.tuning.drop_stopwords,
+        )
+        .expect("the stemming language is checked by StoreConfig::validate");
         Self {
             cfg,
+            tokenizer,
             memories: BTreeMap::new(),
             by_tenant: HashMap::new(),
             segments: vec![],
@@ -451,7 +465,7 @@ impl MemoryStore {
                 let id = m.id;
                 self.next_id = self.next_id.max(id + 1);
                 let text = index_text(&m);
-                let tokens = tokenize(&text);
+                let tokens = self.tokenizer.tokens(&text);
                 let key = (m.tenant.clone(), m.scope.clone());
                 let hnsw_params = self.cfg.tuning.hnsw;
                 let at = match self.segment_of.get(&key) {
@@ -480,7 +494,9 @@ impl MemoryStore {
                     archived: m.archived,
                     plain: m.derived_from.is_empty(),
                 });
-                segment.vecs.extend_from_slice(&hash_embed(&text));
+                segment
+                    .vecs
+                    .extend_from_slice(&hash_embed(&tokens, self.cfg.tuning.trigram_weight));
                 for (term, count) in term_counts(tokens) {
                     segment.postings.entry(term).or_default().push((row, count));
                 }
@@ -538,7 +554,7 @@ impl MemoryStore {
                     if let Some((at, row)) = self.location.remove(&id) {
                         let segment = &mut self.segments[at];
                         segment.rows[row as usize].live = false;
-                        for (term, _) in term_counts(tokenize(&index_text(&m))) {
+                        for (term, _) in term_counts(self.tokenizer.tokens(&index_text(&m))) {
                             if let Some(list) = segment.postings.get_mut(&term) {
                                 if let Ok(i) = list.binary_search_by_key(&row, |entry| entry.0) {
                                     list.remove(i);
@@ -1073,7 +1089,10 @@ impl MemoryStore {
             }
             // Built-in embeddings are unit length, so the dot product is the cosine.
             None => {
-                let query = hash_embed(&q.text);
+                let query = hash_embed(
+                    &self.tokenizer.tokens(&q.text),
+                    self.cfg.tuning.trigram_weight,
+                );
                 for view in views {
                     let seg = &self.segments[view.segment];
                     if self.use_ann(view, q) {
@@ -1097,7 +1116,8 @@ impl MemoryStore {
                 }
             }
         }
-        scored.retain(|entry| entry.1 > 0.0);
+        let floor = self.cfg.tuning.min_vector_similarity;
+        scored.retain(|entry| entry.1 > floor);
         top_ids(scored, pool)
     }
 
@@ -1224,7 +1244,8 @@ impl MemoryStore {
                 .map(|(rank, (_, id))| (id, 1.0 / (rank as f32 + 1.0)))
                 .collect()
         } else {
-            let keyword = self.rank_keyword(&views, &tokenize(&q.text), count, length, pool);
+            let keyword =
+                self.rank_keyword(&views, &self.tokenizer.tokens(&q.text), count, length, pool);
             let vector = self.rank_vector(&views, q, pool);
             let entity = self.rank_entity(&views, &q.text, pool);
             let mut fused = rrf(

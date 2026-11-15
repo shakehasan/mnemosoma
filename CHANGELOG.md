@@ -17,7 +17,7 @@ First public version, not yet tagged.
 - Columnar segments per scope, and a filtered HNSW vector index with parallel build and an exact fallback.
 - Salience decay, time-to-live, archival and cascading erasure.
 - One documented, validated `Tuning` structure for every ranking and indexing parameter.
-- Optional stemming in eighteen languages and English stopword removal.
+- Stemming (eighteen languages) and English stopword removal, on by default and configurable.
 
 ### Python
 

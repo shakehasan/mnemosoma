@@ -120,7 +120,9 @@ def rounds(session: list[dict[str, Any]]) -> list[str]:
     return [session_text(group) for group in out]
 
 
-def ranked_sessions(item: dict[str, Any], granularity: str, embedder: LocalEmbedder | None) -> list[str]:
+def ranked_sessions(
+    item: dict[str, Any], granularity: str, embedder: LocalEmbedder | None, tuning: dict[str, Any] | None
+) -> list[str]:
     """Session ids for one question, best first, as Mnemosoma retrieves them."""
     texts: list[str] = []
     owners: list[str] = []
@@ -132,7 +134,7 @@ def ranked_sessions(item: dict[str, Any], granularity: str, embedder: LocalEmbed
                 owners.append(session_id)
     vectors: Sequence[list[float] | None] = embedder.passages(texts) if embedder else [None] * len(texts)
 
-    store = MemoryStore("benchmark")
+    store = MemoryStore("benchmark", tuning=tuning)
     session_of: dict[int, str] = {}
     for text, session_id, vector in zip(texts, owners, vectors, strict=True):
         session_of[store.write(READER, text, scope=SCOPE, kind="episodic", embedding=vector)] = session_id
@@ -160,13 +162,15 @@ def score(ranked: list[str], evidence: set[str]) -> dict[str, float]:
     return out
 
 
-def run(items: list[dict[str, Any]], granularity: str, embedder: LocalEmbedder | None) -> dict[str, Any]:
+def run(
+    items: list[dict[str, Any]], granularity: str, embedder: LocalEmbedder | None, tuning: dict[str, Any] | None
+) -> dict[str, Any]:
     totals: dict[str, float] = defaultdict(float)
     by_type: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     counts: dict[str, int] = defaultdict(int)
     started = time.perf_counter()
     for number, item in enumerate(items, 1):
-        scores = score(ranked_sessions(item, granularity, embedder), set(item["answer_session_ids"]))
+        scores = score(ranked_sessions(item, granularity, embedder, tuning), set(item["answer_session_ids"]))
         counts[item["question_type"]] += 1
         for name, value in scores.items():
             totals[name] += value
@@ -204,6 +208,7 @@ def main() -> int:
     parser.add_argument("--download", action="store_true", help="download the dataset if it is not cached")
     parser.add_argument("--granularity", choices=["session", "round", "both"], default="both")
     parser.add_argument("--embedder", choices=["builtin", "fastembed"], default="builtin")
+    parser.add_argument("--tuning", type=json.loads, help="engine settings to override, as a JSON object")
     parser.add_argument("--limit", type=int, help="only the first N questions, for a quick check")
     parser.add_argument("--json", type=Path, help="also write the results to this file")
     args = parser.parse_args()
@@ -221,17 +226,19 @@ def main() -> int:
     if args.limit:
         items = items[: args.limit]
     print(f"{len(items)} questions ({skipped} abstention questions left out), embedder: {args.embedder}")
+    if args.tuning:
+        print(f"settings changed from the defaults: {json.dumps(args.tuning)}")
 
     embedder = LocalEmbedder(FASTEMBED_MODEL) if args.embedder == "fastembed" else None
     granularities = ["session", "round"] if args.granularity == "both" else [args.granularity]
-    results = [run(items, granularity, embedder) for granularity in granularities]
+    results = [run(items, granularity, embedder, args.tuning) for granularity in granularities]
     for result in results:
         show(result)
     if args.json:
         payload = {
             "dataset": DATASET_URL,
             "embedder": args.embedder if embedder is None else FASTEMBED_MODEL,
-            "tuning": MemoryStore.default_tuning(),
+            "tuning": {**MemoryStore.default_tuning(), **(args.tuning or {})},
             "results": results,
         }
         args.json.write_text(json.dumps(payload, indent=2), encoding="utf-8")

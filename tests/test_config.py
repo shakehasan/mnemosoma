@@ -77,3 +77,24 @@ def test_chars_per_token_drives_the_budget():
 def test_limits_are_named():
     assert limits.DEFAULT_RECALL_K > 0
     assert limits.RERANK_MIN_POOL >= limits.DEFAULT_RECALL_K
+
+
+def test_stemming_and_stopwords_can_be_turned_off():
+    plain = MemoryStore("k", tuning={"stem_language": None, "drop_stopwords": False})
+    stemmed = MemoryStore("k")
+    for store in (plain, stemmed):
+        store.write(ANA, "Dana booked the venue", scope=TEAM, now=T0)
+        store.write(ANA, "The printer is out of paper", scope=TEAM, now=T0)
+
+    def keyword_rank(store):
+        hit = store.recall(ANA, "who is booking venues", k=1, now=T0)[0]
+        return hit.memory.content, hit.why["keyword_rank"]
+
+    # "booking venues" only matches "booked the venue" by keyword once words are stemmed.
+    assert keyword_rank(stemmed) == ("Dana booked the venue", 1)
+    assert keyword_rank(plain)[1] != 1 or keyword_rank(plain)[0] != "Dana booked the venue"
+
+
+def test_unknown_stemming_language_is_refused():
+    with pytest.raises(ValueError, match="unknown stemming language"):
+        MemoryStore("k", tuning={"stem_language": "klingon"})

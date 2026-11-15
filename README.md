@@ -42,6 +42,7 @@ store.recall(ana, "where does ana work", as_of=june)   # -> "Ana works at Initec
 | **Multi-agent, multi-tenant memory** | Six scopes, per-role policies and hard tenant boundaries, enforced in the engine |
 | **Zero-trust recall** | Every read is checked against the caller's identity; the model never chooses who it is |
 | **Hybrid retrieval** | BM25, vector and entity rankers combined with reciprocal rank fusion |
+| **Text analysis** | Stemming in 18 languages and stopword removal, both configurable |
 | **Approximate vector search** | An HNSW index per scope, filtered so it only returns what the caller may read |
 | **Graph retrieval** | Multi-hop expansion along shared entities, for answers that share no words with the question |
 | **Temporal knowledge** | Bi-temporal facts, supersession chains and point-in-time queries |
@@ -163,6 +164,8 @@ flowchart TB
     CON -- "reads episodes, writes facts" --> SDK
     SDK -.-> TR
 ```
+
+The reasons behind these choices, what each one costs and what was considered instead are in [docs/DESIGN.md](docs/DESIGN.md).
 
 Three paths run through the engine.
 
@@ -334,11 +337,11 @@ store.write(me, "Sits on floor 7 by the east stairwell", scope=team, entities=["
 
 hits = store.recall(me, "where is the lead of Project K012", graph_hops=1)
 hits[1].memory.content   # "Sits on floor 7 by the east stairwell"
-hits[1].why              # {"keyword_rank": 2, "vector_rank": 2, "entity_rank": None,
+hits[1].why              # {"keyword_rank": None, "vector_rank": 2, "entity_rank": None,
                          #  "graph_rank": 1, "shared_by": None}
 ```
 
-With only two memories stored, both get a keyword and a vector rank (they share the word "the" with the question). `graph_rank` is what shows the link.
+No keyword matched it. With only two memories stored it still gets a weak vector rank from spelling overlap; `graph_rank` is what shows the link.
 
 Every hit carries `why`: its rank in each ranker, whether the graph reached it, and whose grant made it visible. In the [evaluation](#evaluation), graph expansion takes this kind of question from 0% to 100% recall@5.
 
@@ -453,10 +456,10 @@ One server process is one identity, set by whoever configures it. The client's m
 | Poisoning: labelled untrusted content surfacing in default recall | 0% | 100 |
 | Injection guard: unlabelled injections caught | 70% | 10 phrasings |
 | Injection guard: clean text wrongly flagged | 0% | 40 |
-| Retrieval, exact words: recall@1 | 93.3% | 300 |
+| Retrieval, exact words: recall@1 | 100% | 300 |
 | Retrieval, one word of five misspelled: recall@5 | 100% | 300 |
-| Retrieval, every word misspelled: recall@5 | 19.0% | 300 |
-| Retrieval, three of five words: recall@5 | 93.0% | 300 |
+| Retrieval, every word misspelled: recall@5 | 24.7% | 300 |
+| Retrieval, three of five words: recall@5 | 100% | 300 |
 | Multi-hop, graph expansion off: recall@5 | 0% | 150 |
 | Multi-hop, graph expansion on: recall@5 | 100% | 150 |
 
@@ -478,23 +481,32 @@ Results on the `longmemeval_s` set, 470 questions, default settings, built-in em
 
 | Indexed by | Metric | @1 | @3 | @5 | @10 |
 |---|---|---|---|---|---|
-| Round (a user message and its reply) | At least one evidence session found | 64.5% | 81.7% | 87.0% | 93.6% |
-| Round | Every evidence session found | 22.6% | 50.9% | 61.9% | 78.3% |
-| Round | NDCG | 64.5% | 65.2% | 68.6% | 73.5% |
-| Session (the whole conversation) | At least one evidence session found | 57.7% | 76.6% | 83.6% | 91.9% |
-| Session | Every evidence session found | 19.8% | 45.1% | 56.0% | 76.6% |
-| Session | NDCG | 57.7% | 58.9% | 62.8% | 68.7% |
+| Round (a user message and its reply) | At least one evidence session found | 78.9% | 89.8% | 93.2% | 97.2% |
+| Round | Every evidence session found | 27.2% | 64.9% | 76.2% | 87.4% |
+| Round | NDCG | 78.9% | 77.9% | 80.8% | 83.9% |
+| Session (the whole conversation) | At least one evidence session found | 73.8% | 87.0% | 91.7% | 95.7% |
+| Session | Every evidence session found | 24.5% | 60.2% | 71.1% | 83.4% |
+| Session | NDCG | 73.8% | 73.8% | 76.9% | 80.3% |
 
 At least one evidence session found, by question type (indexed by round):
 
 | Question type | Questions | @1 | @5 | @10 |
 |---|---|---|---|---|
-| Knowledge update | 72 | 80.6% | 94.4% | 98.6% |
-| Multi-session | 121 | 59.5% | 90.9% | 95.9% |
-| Single session, assistant's words | 56 | 85.7% | 92.9% | 94.6% |
-| Single session, user's words | 64 | 67.2% | 87.5% | 95.3% |
-| Temporal reasoning | 127 | 60.6% | 84.3% | 92.1% |
-| Single session, preference | 30 | 16.7% | 53.3% | 73.3% |
+| Knowledge update | 72 | 90.3% | 98.6% | 100% |
+| Multi-session | 121 | 78.5% | 98.3% | 98.3% |
+| Single session, assistant's words | 56 | 96.4% | 98.2% | 98.2% |
+| Single session, user's words | 64 | 82.8% | 90.6% | 98.4% |
+| Temporal reasoning | 127 | 74.0% | 92.9% | 96.1% |
+| Single session, preference | 30 | 33.3% | 56.7% | 86.7% |
+
+What each text setting contributes (indexed by round, at least one evidence session found):
+
+| Settings | @1 | @3 | @5 | @10 |
+|---|---|---|---|---|
+| Neither | 64.5% | 81.7% | 87.0% | 93.6% |
+| Stemming only | 66.6% | 83.0% | 87.7% | 94.9% |
+| Stopword removal only | 77.9% | 89.8% | 93.4% | 96.4% |
+| Both (the default) | 78.9% | 89.8% | 93.2% | 97.2% |
 
 ```bash
 python benchmarks/longmemeval.py --download
@@ -503,8 +515,9 @@ python benchmarks/longmemeval.py --download
 How to read this:
 
 - **Protocol.** For each question a fresh store is filled with that question's history and queried once with the question text. Nothing is tuned per question. The 30 abstention questions have no evidence session and are left out, as in the paper. The script, the dataset version and the settings are all in the repository, so the run can be repeated. It takes under four minutes on a laptop.
-- **What it shows.** With word and spelling matching alone, an answer-bearing session is in the top 10 for 93.6% of questions. Indexing by round beats indexing by whole session at every cut-off.
-- **Where it is weak.** Preference questions ask for advice that depends on something the user once mentioned, and share few words with it. That needs meaning-based matching. The script accepts `--embedder fastembed` to add a small local embedding model; it works, but a full run takes several hours on a laptop CPU and its results are not published here.
+- **What it shows.** With word and spelling matching alone, an answer-bearing session is the first result for 78.9% of questions and in the top 10 for 97.2%. Indexing by round beats indexing by whole session at every cut-off.
+- **How the defaults were chosen.** Stemming and stopword removal became the defaults after the comparison above, which was run on this same benchmark. LongMemEval has no separate development set, so read the default row as tuned on the test data. Both are standard text-search techniques and were not fitted to individual questions. Two further settings were tried and left off because they lowered recall: a minimum vector similarity of 0.05 (96.8% at 10) and of 0.1 (95.5% at 10).
+- **Where it is weak.** Preference questions ask for advice that depends on something the user once mentioned, and share few words with it. That needs meaning-based matching. The script accepts `--tuning` to change any engine setting and `--embedder fastembed` to add a small local embedding model; it works, but a full run takes several hours on a laptop CPU and its results are not published here.
 - **What it does not show.** This is retrieval only. End-to-end answer accuracy needs a reader model and a judge on top, and has not been measured. No comparison with other systems is made here: published numbers for them use different models and settings.
 - **Data.** The dataset is the authors' cleaned release on Hugging Face (`xiaowu0162/longmemeval-cleaned`, MIT licence). It is downloaded to a local cache when the script runs and is not part of this repository.
 
@@ -518,7 +531,7 @@ Measured with [`crates/mnemosoma-core/examples/load.rs`](crates/mnemosoma-core/e
 | 1,000,000 | 100 | about 750 | 64,000 | 6.7 s | 0.14 ms | 0.16 ms | 0 of 16,000 hits |
 | 1,000,000 | 1 | about 75,000 | 80,000 | 72 s | 2.4 ms | 2.7 ms | 0 of 4,000 hits |
 
-Write speed varied between about 40,000 and 80,000 per second from run to run on this machine.
+Write speed varied between about 40,000 and 80,000 per second from run to run on this machine. This table was measured before stemming and stopword removal became the defaults. In a same-machine comparison afterwards, they lowered write throughput by about 20% and left recall time unchanged; the table has not been re-measured on mains power since.
 
 Run it yourself:
 
@@ -541,7 +554,9 @@ Nothing that shapes behaviour is buried in the code. Every ranking and indexing 
 
 ```python
 MemoryStore.default_tuning()
-# {"rrf_k": 60.0, "pool_factor": 4, "min_pool": 32, "bm25_k1": 1.2, "bm25_b": 0.75,
+# {"stem_language": "english", "drop_stopwords": True, "trigram_weight": 0.5,
+#  "min_vector_similarity": 0.0,
+#  "rrf_k": 60.0, "pool_factor": 4, "min_pool": 32, "bm25_k1": 1.2, "bm25_b": 0.75,
 #  "graph_seeds_per_ranker": 5, "graph_carry": 0.7, "graph_frontier": 16,
 #  "weight_trusted": 1.0, "weight_standard": 0.99, "weight_untrusted": 0.9,
 #  "weight_unconfirmed": 0.99, "salience_weight": 0.01,
@@ -554,6 +569,9 @@ store = MemoryStore(
     required_corroborations=3,         # agents needed to confirm an inference
     tuning={"graph_carry": 0.5, "hnsw": {"m": 32}},
 )
+
+# Text in another language: stem for it, and turn the English stopword list off.
+store = MemoryStore("change-me", tuning={"stem_language": "german", "drop_stopwords": False})
 ```
 
 A value out of range, or a setting name that does not exist, is refused with the name of the setting. Role policies are configuration too (`policies=`). Defaults used by the Python layer, such as how many memories a tool returns, are named in [`mnemosoma/limits.py`](python/mnemosoma/limits.py). The published measurements all use the defaults.
@@ -568,7 +586,7 @@ A value out of range, or a setting name that does not exist, is refused with the
 | Python | Typed SDK with type stubs, async API, pluggable embedder, consolidator, prompt context, validated configuration | Streaming consolidation |
 | Integrations | LangChain retriever and tools, LangGraph `BaseStore`, LangGraph example, MCP server tested over stdio, optional LangSmith tracing | |
 | Storage | In-memory and single-file log | Postgres backend, server mode |
-| Evaluation | 32 engine tests, 45 SDK tests, behaviour eval suite, load benchmark, LongMemEval retrieval benchmark | LongMemEval end-to-end answer accuracy, LoCoMo |
+| Evaluation | 37 engine tests, 48 SDK tests, behaviour eval suite, load benchmark, LongMemEval retrieval benchmark | LongMemEval end-to-end answer accuracy, LoCoMo |
 | Code quality | `rustfmt`, Clippy with warnings as errors, Ruff and mypy, all enforced in CI | |
 | Packaging | CI on Linux, macOS and Windows; release pipeline for wheels on five platforms, source distribution and crate ([RELEASING.md](RELEASING.md)) | First release to PyPI and crates.io |
 
@@ -595,6 +613,10 @@ pytest
 ```
 
 ```bash
+python examples/quickstart.py
+```
+
+```bash
 python examples/team_graph.py
 ```
 
@@ -607,14 +629,17 @@ On Windows this was built with the GNU Rust toolchain, which needs an LLVM `dllt
 Layout:
 
 ```text
-crates/mnemosoma-core/   Rust engine: identity, memory, provenance, index, HNSW, store
+crates/mnemosoma-core/   Rust engine: identity, memory, provenance, text, index, HNSW, config, store
 crates/mnemosoma-py/     PyO3 bindings
 python/mnemosoma/        SDK, consolidation, guards, context, LangChain, LangGraph store, MCP server, tracing
-examples/                LangGraph multi-agent example
+examples/                Offline quickstart and a LangGraph multi-agent example
 evals/                   Behaviour eval suite
 benchmarks/              LongMemEval retrieval benchmark
+docs/DESIGN.md           Design decisions and their trade-offs
 tests/                   Python tests
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks CI runs and the code conventions, [SECURITY.md](SECURITY.md) for the security model and how to report a problem, and [CHANGELOG.md](CHANGELOG.md) for what has changed.
 
 ## Where this stands
 
