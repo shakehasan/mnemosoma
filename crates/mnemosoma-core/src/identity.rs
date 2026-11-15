@@ -82,9 +82,16 @@ pub fn default_roles() -> HashMap<String, RolePolicy> {
         ),
         (
             "executor".into(),
-            policy(&[AgentPrivate, Role, Team, UserPrivate], &[AgentPrivate, Team], false),
+            policy(
+                &[AgentPrivate, Role, Team, UserPrivate],
+                &[AgentPrivate, Team],
+                false,
+            ),
         ),
-        ("reviewer".into(), policy(&all, &[AgentPrivate, Team, Role], false)),
+        (
+            "reviewer".into(),
+            policy(&all, &[AgentPrivate, Team, Role], false),
+        ),
         ("curator".into(), policy(&all, &all, true)),
     ])
 }

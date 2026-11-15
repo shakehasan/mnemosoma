@@ -9,6 +9,33 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: Format, lint and type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy, warnings as errors
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Python formatting, lint and types
+        run: |
+          pip install ruff mypy "langchain-core>=1.0" "langgraph>=1.0" "langsmith>=0.4" "mcp>=1.2"
+          ruff format --check python tests evals examples benchmarks
+          ruff check python tests evals examples benchmarks
+          mypy
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:

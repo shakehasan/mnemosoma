@@ -10,10 +10,38 @@ use mnemosoma_core::*;
 use std::time::Instant;
 
 const WORDS: &[&str] = &[
-    "venue", "contract", "invoice", "launch", "budget", "deadline", "customer", "refund",
-    "shipment", "meeting", "roadmap", "pricing", "renewal", "outage", "report", "design",
-    "hiring", "travel", "catering", "review", "migration", "release", "audit", "forecast",
-    "onboarding", "feedback", "warranty", "delivery", "campaign", "inventory", "policy", "training",
+    "venue",
+    "contract",
+    "invoice",
+    "launch",
+    "budget",
+    "deadline",
+    "customer",
+    "refund",
+    "shipment",
+    "meeting",
+    "roadmap",
+    "pricing",
+    "renewal",
+    "outage",
+    "report",
+    "design",
+    "hiring",
+    "travel",
+    "catering",
+    "review",
+    "migration",
+    "release",
+    "audit",
+    "forecast",
+    "onboarding",
+    "feedback",
+    "warranty",
+    "delivery",
+    "campaign",
+    "inventory",
+    "policy",
+    "training",
 ];
 const ROLES: &[&str] = &["planner", "researcher", "executor", "reviewer"];
 
@@ -30,7 +58,10 @@ impl Rng {
         (self.next() % n as u64) as usize
     }
     fn sentence(&mut self, words: usize) -> String {
-        (0..words).map(|_| WORDS[self.below(WORDS.len())]).collect::<Vec<_>>().join(" ")
+        (0..words)
+            .map(|_| WORDS[self.below(WORDS.len())])
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -77,7 +108,9 @@ fn main() {
         let words = 8 + rng.below(12);
         let memory = NewMemory::new(scope, MemoryKind::Episodic, rng.sentence(words));
         let t = Instant::now();
-        store.write(&who, memory, now + written as i64).expect("write allowed");
+        store
+            .write(&who, memory, now + written as i64)
+            .expect("write allowed");
         write_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         written += 1;
     }
@@ -117,13 +150,33 @@ fn main() {
     recall_ms.sort_by(f64::total_cmp);
 
     println!("memories            {total}");
-    println!("tenants             {tenants}  ({} per tenant)", total / tenants);
-    println!("users / agents      {} / {} per tenant", users_per_tenant, agents_per_tenant);
-    println!("write throughput    {:.0} per second", total as f64 / write_secs);
-    println!("write p50 / p95     {:.4} / {:.4} ms", percentile(&write_ms, 0.5), percentile(&write_ms, 0.95));
+    println!(
+        "tenants             {tenants}  ({} per tenant)",
+        total / tenants
+    );
+    println!(
+        "users / agents      {} / {} per tenant",
+        users_per_tenant, agents_per_tenant
+    );
+    println!(
+        "write throughput    {:.0} per second",
+        total as f64 / write_secs
+    );
+    println!(
+        "write p50 / p95     {:.4} / {:.4} ms",
+        percentile(&write_ms, 0.5),
+        percentile(&write_ms, 0.95)
+    );
     println!("index build         {indexed} vectors in {index_secs:.1} s");
-    println!("recall p50 / p95    {:.3} / {:.3} ms", percentile(&recall_ms, 0.5), percentile(&recall_ms, 0.95));
+    println!(
+        "recall p50 / p95    {:.3} / {:.3} ms",
+        percentile(&recall_ms, 0.5),
+        percentile(&recall_ms, 0.95)
+    );
     println!("recalls / hits      {queries} / {returned}");
     println!("permission leaks    {leaks}");
-    assert_eq!(leaks, 0, "a recall returned a memory outside the caller's scopes");
+    assert_eq!(
+        leaks, 0,
+        "a recall returned a memory outside the caller's scopes"
+    );
 }

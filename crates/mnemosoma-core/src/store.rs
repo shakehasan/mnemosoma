@@ -2,9 +2,13 @@
 //! and the read and write paths.
 
 use crate::ann::Hnsw;
+use crate::config::Tuning;
 use crate::identity::{default_roles, Grant, Identity, RolePolicy, Scope, ScopeKind};
 use crate::index::{cosine, dot, hash_embed, rrf, sort_desc, tokenize, top_ids, HASH_DIM};
-use crate::memory::{Assertion, Memory, MemoryKind, NewMemory, Trust};
+use crate::memory::{
+    Assertion, Memory, MemoryKind, NewMemory, Trust, APPROVED_PREFIX,
+    DEFAULT_REQUIRED_CORROBORATIONS,
+};
 use crate::provenance;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -44,6 +48,11 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+/// Default for [`StoreConfig::half_life_ms`]: thirty days.
+pub const DEFAULT_HALF_LIFE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// Default for [`StoreConfig::archive_below`].
+pub const DEFAULT_ARCHIVE_BELOW: f32 = 0.05;
+
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
     /// Key for write-time HMAC signatures. Keep it outside the log file.
@@ -52,17 +61,48 @@ pub struct StoreConfig {
     pub half_life_ms: i64,
     /// Episodes whose decayed salience falls below this are archived by `sweep`.
     pub archive_below: f32,
+    /// Corroborations from other agents that establish an inference.
+    pub required_corroborations: usize,
     pub policies: HashMap<String, RolePolicy>,
+    /// Ranking and indexing parameters. See [`Tuning`].
+    pub tuning: Tuning,
 }
 
 impl StoreConfig {
     pub fn new(signing_key: impl Into<Vec<u8>>) -> Self {
         Self {
             signing_key: signing_key.into(),
-            half_life_ms: 30 * 24 * 60 * 60 * 1000,
-            archive_below: 0.05,
+            half_life_ms: DEFAULT_HALF_LIFE_MS,
+            archive_below: DEFAULT_ARCHIVE_BELOW,
+            required_corroborations: DEFAULT_REQUIRED_CORROBORATIONS,
             policies: default_roles(),
+            tuning: Tuning::default(),
         }
+    }
+
+    /// Check every setting is usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invalid`] naming the first setting out of range.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.signing_key.is_empty() {
+            return Err(Error::Invalid("signing_key must not be empty".into()));
+        }
+        if self.half_life_ms <= 0 {
+            return Err(Error::Invalid("half_life_ms must be positive".into()));
+        }
+        if !(0.0..=1.0).contains(&self.archive_below) {
+            return Err(Error::Invalid(
+                "archive_below must be between 0 and 1".into(),
+            ));
+        }
+        if self.required_corroborations == 0 {
+            return Err(Error::Invalid(
+                "required_corroborations must be at least 1".into(),
+            ));
+        }
+        self.tuning.validate().map_err(Error::Invalid)
     }
 }
 
@@ -223,18 +263,12 @@ struct Segment {
 }
 
 fn entity_names(m: &Memory) -> BTreeSet<String> {
-    m.entities.iter().filter(|e| !e.trim().is_empty()).map(|e| e.to_lowercase()).collect()
+    m.entities
+        .iter()
+        .filter(|e| !e.trim().is_empty())
+        .map(|e| e.to_lowercase())
+        .collect()
 }
-
-/// Below this many eligible rows in a segment, vector scoring is exact: a
-/// scan is fast at that size and has perfect recall.
-const ANN_MIN_ROWS: usize = 4_096;
-/// When the caller can read less than this share of a segment, the
-/// approximate index would walk mostly past rows it must skip, so an exact
-/// scan of the eligible rows is used instead.
-const ANN_MIN_SHARE: f32 = 0.05;
-/// Upper bound on the approximate search's candidate list.
-const ANN_MAX_EF: usize = 4_096;
 
 /// Caller-supplied embeddings for one segment, normalised and stored flat,
 /// with an approximate index over them. All must share the first one's
@@ -248,6 +282,16 @@ struct Embeddings {
 }
 
 impl Embeddings {
+    fn new(dim: usize, params: crate::ann::HnswParams) -> Self {
+        Self {
+            dim,
+            data: Vec::new(),
+            node_row: Vec::new(),
+            row_node: HashMap::new(),
+            ann: Hnsw::new(params),
+        }
+    }
+
     fn catch_up(&mut self) -> usize {
         let mut added = 0;
         while self.ann.len() < self.node_row.len() {
@@ -348,7 +392,13 @@ impl MemoryStore {
 
     /// Open a store backed by an append-only log file, replaying it if it
     /// exists. Entries whose signature does not verify are quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the configuration is invalid, or the log cannot be read,
+    /// parsed or opened for appending.
     pub fn open(path: impl AsRef<Path>, cfg: StoreConfig) -> Result<Self, Error> {
+        cfg.validate()?;
         let path = path.as_ref().to_path_buf();
         let mut store = Self::in_memory(cfg);
         if path.exists() {
@@ -389,7 +439,10 @@ impl MemoryStore {
 
     fn apply(&mut self, event: Event) {
         match event {
-            Event::Meta { next_id, next_grant_id } => {
+            Event::Meta {
+                next_id,
+                next_grant_id,
+            } => {
                 self.next_id = self.next_id.max(next_id);
                 self.next_grant_id = self.next_grant_id.max(next_grant_id);
             }
@@ -400,10 +453,14 @@ impl MemoryStore {
                 let text = index_text(&m);
                 let tokens = tokenize(&text);
                 let key = (m.tenant.clone(), m.scope.clone());
+                let hnsw_params = self.cfg.tuning.hnsw;
                 let at = match self.segment_of.get(&key) {
                     Some(at) => *at,
                     None => {
-                        self.segments.push(Segment::default());
+                        self.segments.push(Segment {
+                            hash_ann: Hnsw::new(hnsw_params),
+                            ..Segment::default()
+                        });
                         self.segment_of.insert(key, self.segments.len() - 1);
                         self.segments.len() - 1
                     }
@@ -436,13 +493,9 @@ impl MemoryStore {
                 if let Some(embedding) = &m.embedding {
                     segment.with_embedding.push(row);
                     if let Some(unit) = normalised(embedding) {
-                        let emb = segment.emb.get_or_insert_with(|| Embeddings {
-                            dim: unit.len(),
-                            data: Vec::new(),
-                            node_row: Vec::new(),
-                            row_node: HashMap::new(),
-                            ann: Hnsw::default(),
-                        });
+                        let emb = segment
+                            .emb
+                            .get_or_insert_with(|| Embeddings::new(unit.len(), hnsw_params));
                         if emb.dim == unit.len() {
                             emb.row_node.insert(row, emb.node_row.len() as u32);
                             emb.node_row.push(row);
@@ -563,12 +616,17 @@ impl MemoryStore {
                 out.write_all(b"\n")?;
                 Ok(())
             };
-            put(&Event::Meta { next_id: self.next_id, next_grant_id: self.next_grant_id })?;
+            put(&Event::Meta {
+                next_id: self.next_id,
+                next_grant_id: self.next_grant_id,
+            })?;
             for g in &self.grants {
                 put(&Event::Grant { grant: g.clone() })?;
             }
             for m in self.memories.values() {
-                put(&Event::Write { memory: Box::new(m.clone()) })?;
+                put(&Event::Write {
+                    memory: Box::new(m.clone()),
+                })?;
             }
             out.flush()?;
         }
@@ -586,7 +644,14 @@ impl MemoryStore {
         self.cfg.policies.get(&who.role)
     }
 
-    fn grant_covers(&self, tenant: &str, owner: &str, reader: &str, tags: &[String], now: i64) -> bool {
+    fn grant_covers(
+        &self,
+        tenant: &str,
+        owner: &str,
+        reader: &str,
+        tags: &[String],
+        now: i64,
+    ) -> bool {
         self.grants.iter().any(|g| {
             g.tenant == tenant
                 && g.grantor == owner
@@ -619,7 +684,13 @@ impl MemoryStore {
 
     /// Readable only if every memory it was derived from is readable too.
     /// This is what makes a revoked grant also hide the facts built on it.
-    fn can_read_deep(&self, who: &Identity, id: u64, now: i64, memo: &mut HashMap<u64, bool>) -> bool {
+    fn can_read_deep(
+        &self,
+        who: &Identity,
+        id: u64,
+        now: i64,
+        memo: &mut HashMap<u64, bool>,
+    ) -> bool {
         if let Some(known) = memo.get(&id) {
             return *known;
         }
@@ -627,7 +698,9 @@ impl MemoryStore {
             None => false,
             Some(m) => {
                 self.can_read(who, m, now)
-                    && m.derived_from.iter().all(|src| self.can_read_deep(who, *src, now, memo))
+                    && m.derived_from
+                        .iter()
+                        .all(|src| self.can_read_deep(who, *src, now, memo))
             }
         };
         memo.insert(id, ok);
@@ -675,7 +748,11 @@ impl MemoryStore {
             Scope::UserPrivate(user) => {
                 let mut tagged = false;
                 for g in &self.grants {
-                    if g.tenant == who.tenant && g.grantor == *user && g.grantee == who.user && g.active(now) {
+                    if g.tenant == who.tenant
+                        && g.grantor == *user
+                        && g.grantee == who.user
+                        && g.active(now)
+                    {
                         if g.tag.is_none() {
                             return Some(true);
                         }
@@ -770,11 +847,15 @@ impl MemoryStore {
         // Find this fact's neighbours in valid time before it joins the chain.
         // Two agents writing the same subject land in one ordered chain, and a
         // fact that arrives late is slotted into the past where it belongs.
-        let (mut before, mut after): (Option<(i64, u64)>, Option<(i64, u64)>) = (None, None);
+        // Each is (valid_from, id) of the nearest version on that side.
+        let mut before: Option<(i64, u64)> = None;
+        let mut after: Option<(i64, u64)> = None;
         if let Some(subject) = &memory.subject {
             let key = (memory.tenant.clone(), memory.scope.clone(), subject.clone());
             for other in self.chains.get(&key).into_iter().flatten() {
-                let Some(o) = self.memories.get(other) else { continue };
+                let Some(o) = self.memories.get(other) else {
+                    continue;
+                };
                 let entry = (o.valid_from, o.id);
                 if o.valid_from <= valid_from {
                     if before.is_none_or(|b| entry > b) {
@@ -786,12 +867,22 @@ impl MemoryStore {
             }
         }
 
-        self.emit(Event::Write { memory: Box::new(memory) })?;
+        self.emit(Event::Write {
+            memory: Box::new(memory),
+        })?;
         if let Some((_, prev)) = before {
-            self.emit(Event::Supersede { old: prev, new: id, at: valid_from })?;
+            self.emit(Event::Supersede {
+                old: prev,
+                new: id,
+                at: valid_from,
+            })?;
         }
         if let Some((next_from, next)) = after {
-            self.emit(Event::Supersede { old: id, new: next, at: next_from })?;
+            self.emit(Event::Supersede {
+                old: id,
+                new: next,
+                at: next_from,
+            })?;
         }
         Ok(id)
     }
@@ -815,8 +906,12 @@ impl MemoryStore {
             if !q.scopes.is_empty() && !q.scopes.contains(&scope.kind()) {
                 continue;
             }
-            let Some(whole_scope) = self.scope_access(who, &scope, now) else { continue };
-            let Some(&segment) = self.segment_of.get(&(who.tenant.clone(), scope)) else { continue };
+            let Some(whole_scope) = self.scope_access(who, &scope, now) else {
+                continue;
+            };
+            let Some(&segment) = self.segment_of.get(&(who.tenant.clone(), scope)) else {
+                continue;
+            };
             let seg = &self.segments[segment];
             let mut mask = vec![false; seg.rows.len()];
             let mut rows = Vec::new();
@@ -841,7 +936,11 @@ impl MemoryStore {
             }
             count += rows.len();
             if !rows.is_empty() {
-                views.push(View { segment, mask, rows });
+                views.push(View {
+                    segment,
+                    mask,
+                    rows,
+                });
             }
         }
         (views, count, length)
@@ -850,9 +949,15 @@ impl MemoryStore {
     /// Okapi BM25 through the posting lists. Document counts and lengths come
     /// from the caller's eligible rows only, so scores reveal nothing about
     /// memories the caller cannot read.
-    fn rank_keyword(&self, views: &[View], query: &[String], count: usize, length: u64, pool: usize) -> Vec<u64> {
-        const K1: f32 = 1.2;
-        const B: f32 = 0.75;
+    fn rank_keyword(
+        &self,
+        views: &[View],
+        query: &[String],
+        count: usize,
+        length: u64,
+        pool: usize,
+    ) -> Vec<u64> {
+        let (k1, b) = (self.cfg.tuning.bm25_k1, self.cfg.tuning.bm25_b);
         let mut terms: Vec<&String> = query.iter().collect();
         terms.sort();
         terms.dedup();
@@ -864,11 +969,17 @@ impl MemoryStore {
             let lists: Vec<(usize, &Vec<(u32, u32)>)> = views
                 .iter()
                 .enumerate()
-                .filter_map(|(v, view)| Some((v, self.segments[view.segment].postings.get(term.as_str())?)))
+                .filter_map(|(v, view)| {
+                    Some((v, self.segments[view.segment].postings.get(term.as_str())?))
+                })
                 .collect();
             let df: usize = lists
                 .iter()
-                .map(|(v, list)| list.iter().filter(|entry| views[*v].mask[entry.0 as usize]).count())
+                .map(|(v, list)| {
+                    list.iter()
+                        .filter(|entry| views[*v].mask[entry.0 as usize])
+                        .count()
+                })
                 .sum();
             if df == 0 {
                 continue;
@@ -882,32 +993,46 @@ impl MemoryStore {
                         continue;
                     }
                     let tf = *tf as f32;
-                    let len_norm = K1 * (1.0 - B + B * rows[r].doc_len as f32 / avg_len);
+                    let len_norm = k1 * (1.0 - b + b * rows[r].doc_len as f32 / avg_len);
                     if scores[v][r] == 0.0 {
                         touched.push((v, *row));
                     }
-                    scores[v][r] += idf * (tf * (K1 + 1.0)) / (tf + len_norm);
+                    scores[v][r] += idf * (tf * (k1 + 1.0)) / (tf + len_norm);
                 }
             }
         }
         let scored = touched
             .into_iter()
-            .map(|(v, row)| (self.segments[views[v].segment].rows[row as usize].id, scores[v][row as usize]))
+            .map(|(v, row)| {
+                (
+                    self.segments[views[v].segment].rows[row as usize].id,
+                    scores[v][row as usize],
+                )
+            })
             .collect();
         top_ids(scored, pool)
+    }
+
+    fn established(&self, m: &Memory) -> bool {
+        m.established_with(self.cfg.required_corroborations)
     }
 
     /// Whether vector scoring for this view should use the approximate index.
     fn use_ann(&self, view: &View, q: &Query) -> bool {
         let total = self.segments[view.segment].rows.len().max(1);
-        !q.exact && view.rows.len() >= ANN_MIN_ROWS && view.rows.len() as f32 / total as f32 >= ANN_MIN_SHARE
+        let tuning = &self.cfg.tuning;
+        !q.exact
+            && view.rows.len() >= tuning.ann_min_rows
+            && view.rows.len() as f32 / total as f32 >= tuning.ann_min_share
     }
 
     /// Candidate list size for an approximate search: wider when the caller
     /// can read only part of the segment, since skipped rows still take room.
     fn ef_for(&self, view: &View, pool: usize) -> usize {
         let share = view.rows.len() as f32 / self.segments[view.segment].rows.len().max(1) as f32;
-        ((pool.max(64) as f32 / share).ceil() as usize).clamp(pool, ANN_MAX_EF)
+        let tuning = &self.cfg.tuning;
+        ((pool.max(tuning.ann_min_ef) as f32 / share).ceil() as usize)
+            .clamp(pool, tuning.ann_max_ef.max(pool))
     }
 
     fn rank_vector(&self, views: &[View], q: &Query, pool: usize) -> Vec<u64> {
@@ -918,16 +1043,27 @@ impl MemoryStore {
                 let unit = normalised(query);
                 for view in views {
                     let seg = &self.segments[view.segment];
-                    let indexed = seg.emb.as_ref().filter(|e| unit.as_ref().is_some_and(|u| u.len() == e.dim));
-                    if let (Some(emb), Some(unit), true) = (indexed, unit.as_ref(), self.use_ann(view, q)) {
+                    let indexed = seg
+                        .emb
+                        .as_ref()
+                        .filter(|e| unit.as_ref().is_some_and(|u| u.len() == e.dim));
+                    if let (Some(emb), Some(unit), true) =
+                        (indexed, unit.as_ref(), self.use_ann(view, q))
+                    {
                         let accept = |node: u32| view.mask[emb.node_row[node as usize] as usize];
                         let ef = self.ef_for(view, pool);
-                        for (node, sim) in emb.ann.search(unit, &emb.data, emb.dim, pool, ef, &accept) {
+                        for (node, sim) in
+                            emb.ann.search(unit, &emb.data, emb.dim, pool, ef, &accept)
+                        {
                             scored.push((seg.rows[emb.node_row[node as usize] as usize].id, sim));
                         }
                         continue;
                     }
-                    for row in seg.with_embedding.iter().filter(|r| view.mask[**r as usize]) {
+                    for row in seg
+                        .with_embedding
+                        .iter()
+                        .filter(|r| view.mask[**r as usize])
+                    {
                         let id = seg.rows[*row as usize].id;
                         if let Some(e) = self.memories.get(&id).and_then(|m| m.embedding.as_ref()) {
                             scored.push((id, cosine(query, e)));
@@ -943,14 +1079,20 @@ impl MemoryStore {
                     if self.use_ann(view, q) {
                         let accept = |row: u32| view.mask[row as usize];
                         let ef = self.ef_for(view, pool);
-                        for (row, sim) in seg.hash_ann.search(&query, &seg.vecs, HASH_DIM, pool, ef, &accept) {
+                        for (row, sim) in seg
+                            .hash_ann
+                            .search(&query, &seg.vecs, HASH_DIM, pool, ef, &accept)
+                        {
                             scored.push((seg.rows[row as usize].id, sim));
                         }
                         continue;
                     }
                     for row in &view.rows {
                         let start = *row as usize * HASH_DIM;
-                        scored.push((seg.rows[*row as usize].id, dot(&query, &seg.vecs[start..start + HASH_DIM])));
+                        scored.push((
+                            seg.rows[*row as usize].id,
+                            dot(&query, &seg.vecs[start..start + HASH_DIM]),
+                        ));
                     }
                 }
             }
@@ -966,7 +1108,9 @@ impl MemoryStore {
             let seg = &self.segments[view.segment];
             for row in seg.with_entities.iter().filter(|r| view.mask[**r as usize]) {
                 let id = seg.rows[*row as usize].id;
-                let Some(m) = self.memories.get(&id) else { continue };
+                let Some(m) = self.memories.get(&id) else {
+                    continue;
+                };
                 let named = m
                     .entities
                     .iter()
@@ -987,7 +1131,7 @@ impl MemoryStore {
     /// common name does not flood the results. Only eligible rows are ever
     /// visited, and a memory never earns credit from its own entities.
     fn spread(&self, views: &[View], seeds: &[(u64, f32)], hops: u8) -> Vec<(u64, f32)> {
-        const CARRY: f32 = 0.7;
+        let carry = self.cfg.tuning.graph_carry;
         let mut frontier: Vec<(u64, f32)> = seeds.to_vec();
         let mut reached: HashMap<u64, f32> = HashMap::new();
         for _ in 0..hops {
@@ -1019,17 +1163,21 @@ impl MemoryStore {
                         .filter(|(source, _)| *source != id)
                         .map(|(_, activation)| *activation)
                         .fold(0.0, f32::max);
-                    if strongest > 0.0 {
-                        *found.entry(id).or_insert(0.0) += CARRY * strongest / spread_over;
+                    let passed_on = carry * strongest / spread_over;
+                    if passed_on > 0.0 {
+                        *found.entry(id).or_insert(0.0) += passed_on;
                     }
                 }
             }
             if found.is_empty() {
                 break;
             }
-            frontier = found.iter().map(|(id, activation)| (*id, *activation)).collect();
+            frontier = found
+                .iter()
+                .map(|(id, activation)| (*id, *activation))
+                .collect();
             sort_desc(&mut frontier);
-            frontier.truncate(16);
+            frontier.truncate(self.cfg.tuning.graph_frontier);
             reached.extend(found);
         }
         let mut out: Vec<(u64, f32)> = reached.into_iter().collect();
@@ -1047,7 +1195,8 @@ impl MemoryStore {
         if count == 0 {
             return vec![];
         }
-        let pool = (q.k * 4).max(32);
+        let tuning = &self.cfg.tuning;
+        let pool = (q.k * tuning.pool_factor).max(tuning.min_pool);
         // Bring the approximate index up to date for the segments that will use it.
         for view in &views {
             if self.use_ann(view, q) {
@@ -1061,7 +1210,11 @@ impl MemoryStore {
             let mut newest: Vec<(i64, u64)> = Vec::with_capacity(count);
             for view in &views {
                 let rows = &self.segments[view.segment].rows;
-                newest.extend(view.rows.iter().map(|r| (rows[*r as usize].recorded_at, rows[*r as usize].id)));
+                newest.extend(
+                    view.rows
+                        .iter()
+                        .map(|r| (rows[*r as usize].recorded_at, rows[*r as usize].id)),
+                );
             }
             newest.sort_unstable_by(|a, b| b.cmp(a));
             newest.truncate(pool);
@@ -1074,20 +1227,35 @@ impl MemoryStore {
             let keyword = self.rank_keyword(&views, &tokenize(&q.text), count, length, pool);
             let vector = self.rank_vector(&views, q, pool);
             let entity = self.rank_entity(&views, &q.text, pool);
-            let mut fused = rrf(&[keyword.clone(), vector.clone(), entity.clone()]);
+            let mut fused = rrf(
+                &[keyword.clone(), vector.clone(), entity.clone()],
+                self.cfg.tuning.rrf_k,
+            );
 
             // The best few matches from each ranker are where the graph starts.
             let mut seeds: Vec<(u64, f32)> = Vec::new();
-            for id in [&keyword, &vector, &entity].into_iter().flat_map(|list| list.iter().take(5)) {
+            for id in [&keyword, &vector, &entity]
+                .into_iter()
+                .flat_map(|list| list.iter().take(self.cfg.tuning.graph_seeds_per_ranker))
+            {
                 if !seeds.iter().any(|(seen, _)| seen == id) {
                     seeds.push((*id, fused[id]));
                 }
             }
-            let reached = if q.graph_hops == 0 { vec![] } else { self.spread(&views, &seeds, q.graph_hops) };
+            let reached = if q.graph_hops == 0 {
+                vec![]
+            } else {
+                self.spread(&views, &seeds, q.graph_hops)
+            };
             for (id, activation) in &reached {
                 *fused.entry(*id).or_insert(0.0) += activation;
             }
-            rankings = [keyword, vector, entity, reached.into_iter().map(|r| r.0).collect()];
+            rankings = [
+                keyword,
+                vector,
+                entity,
+                reached.into_iter().map(|r| r.0).collect(),
+            ];
 
             // Relevance decides the order. Rank fusion packs scores close
             // together: the best match in two rankers leads the next by under
@@ -1099,13 +1267,19 @@ impl MemoryStore {
                 .into_iter()
                 .map(|(id, relevance)| {
                     let m = &self.memories[&id];
+                    let tuning = &self.cfg.tuning;
                     let trust = match m.trust {
-                        Trust::Trusted => 1.0,
-                        Trust::Standard => 0.99,
-                        Trust::Untrusted => 0.9,
+                        Trust::Trusted => tuning.weight_trusted,
+                        Trust::Standard => tuning.weight_standard,
+                        Trust::Untrusted => tuning.weight_untrusted,
                     };
-                    let established = if m.established() { 1.0 } else { 0.99 };
-                    let salience = 0.99 + 0.01 * m.salience * self.decay(m, now);
+                    let established = if self.established(m) {
+                        1.0
+                    } else {
+                        tuning.weight_unconfirmed
+                    };
+                    let salience = (1.0 - tuning.salience_weight)
+                        + tuning.salience_weight * m.salience * self.decay(m, now);
                     (id, relevance * trust * established * salience)
                 })
                 .collect()
@@ -1120,7 +1294,7 @@ impl MemoryStore {
                 break;
             }
             let m = &self.memories[&id];
-            let cost = m.content.len() / 4 + 1;
+            let cost = m.content.len() / self.cfg.tuning.chars_per_token + 1;
             if q.token_budget.is_some_and(|budget| used + cost > budget) {
                 continue;
             }
@@ -1138,7 +1312,12 @@ impl MemoryStore {
                     _ => None,
                 },
             };
-            hits.push(Hit { established: memory.established(), memory, score, why });
+            hits.push(Hit {
+                established: self.established(&memory),
+                memory,
+                score,
+                why,
+            });
         }
         // Being recalled is what keeps a memory from decaying.
         for hit in &hits {
@@ -1189,9 +1368,14 @@ impl MemoryStore {
         tag: Option<String>,
         expires_at: Option<i64>,
     ) -> Result<u64, Error> {
-        let allowed = self.policy(who).is_some_and(|p| p.read.contains(&ScopeKind::UserPrivate));
+        let allowed = self
+            .policy(who)
+            .is_some_and(|p| p.read.contains(&ScopeKind::UserPrivate));
         if !allowed {
-            return Err(Error::Denied(format!("role '{}' may not share user memory", who.role)));
+            return Err(Error::Denied(format!(
+                "role '{}' may not share user memory",
+                who.role
+            )));
         }
         if grantee == who.user {
             return Err(Error::Invalid("cannot grant to yourself".into()));
@@ -1218,7 +1402,9 @@ impl MemoryStore {
             .iter()
             .any(|g| g.id == grant_id && g.tenant == who.tenant && g.grantor == who.user);
         if !owns {
-            return Err(Error::Denied(format!("grant {grant_id} is not yours to revoke")));
+            return Err(Error::Denied(format!(
+                "grant {grant_id} is not yours to revoke"
+            )));
         }
         self.emit(Event::Revoke { grant_id, at: now })
     }
@@ -1232,9 +1418,11 @@ impl MemoryStore {
     pub fn corroborate(&mut self, who: &Identity, id: u64, now: i64) -> Result<(), Error> {
         let memory = self.get(who, id, now)?;
         let by = if self.policy(who).is_some_and(|p| p.can_promote) {
-            format!("approved:{}", who.agent)
+            format!("{APPROVED_PREFIX}{}", who.agent)
         } else if who.agent == memory.author_agent {
-            return Err(Error::Invalid("an agent cannot corroborate its own memory".into()));
+            return Err(Error::Invalid(
+                "an agent cannot corroborate its own memory".into(),
+            ));
         } else {
             who.agent.clone()
         };
@@ -1286,7 +1474,10 @@ impl MemoryStore {
         for id in &fading {
             self.emit(Event::Archive { id: *id })?;
         }
-        Ok(SweepReport { expired: expired.len(), archived: fading.len() })
+        Ok(SweepReport {
+            expired: expired.len(),
+            archived: fading.len(),
+        })
     }
 
     /// Add every memory not yet in the approximate vector indexes and return
@@ -1307,7 +1498,9 @@ impl MemoryStore {
         std::thread::scope(|scope| {
             let handles: Vec<_> = shares
                 .into_iter()
-                .map(|share| scope.spawn(move || share.into_iter().map(Segment::catch_up).sum::<usize>()))
+                .map(|share| {
+                    scope.spawn(move || share.into_iter().map(Segment::catch_up).sum::<usize>())
+                })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
         })
@@ -1316,8 +1509,16 @@ impl MemoryStore {
     pub fn stats(&self) -> Stats {
         Stats {
             memories: self.memories.len(),
-            tenants: self.by_tenant.values().filter(|ids| !ids.is_empty()).count(),
-            grants: self.grants.iter().filter(|g| g.revoked_at.is_none()).count(),
+            tenants: self
+                .by_tenant
+                .values()
+                .filter(|ids| !ids.is_empty())
+                .count(),
+            grants: self
+                .grants
+                .iter()
+                .filter(|g| g.revoked_at.is_none())
+                .count(),
             quarantined: self.quarantined,
         }
     }

@@ -9,9 +9,10 @@ for any reader who loses access to them.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
 
+from . import limits
 from .store import MemoryStore
 from .types import Identity, Memory, Moment, Scope
 
@@ -56,7 +57,9 @@ class Consolidator:
         batch_size: Most episodes handed to the extractor in one call.
     """
 
-    def __init__(self, store: MemoryStore, extractor: Extractor, *, batch_size: int = 20) -> None:
+    def __init__(
+        self, store: MemoryStore, extractor: Extractor, *, batch_size: int = limits.DEFAULT_CONSOLIDATION_BATCH
+    ) -> None:
         self._store = store
         self._extract = extractor
         self._batch_size = batch_size
@@ -71,7 +74,7 @@ class Consolidator:
         key = (who.tenant, scope)
         after = self._cursor.get(key, 0)
         hits = self._store.recall(
-            who, kinds=["episodic"], scopes=[scope.kind], k=10_000, min_trust="untrusted", now=now
+            who, kinds=["episodic"], scopes=[scope.kind], k=limits.SCAN_LIMIT, min_trust="untrusted", now=now
         )
         episodes = sorted(
             (h.memory for h in hits if h.memory.scope == scope and h.memory.id > after),
@@ -127,6 +130,12 @@ class Consolidator:
             current = versions[-1] if versions else None
             return current if current is not None and _same(current.content, fact.content) else None
         hits = self._store.recall(
-            who, fact.content, kinds=["semantic"], scopes=[scope.kind], k=5, min_trust="untrusted", now=now
+            who,
+            fact.content,
+            kinds=["semantic"],
+            scopes=[scope.kind],
+            k=limits.DUPLICATE_SEARCH_K,
+            min_trust="untrusted",
+            now=now,
         )
         return next((h.memory for h in hits if h.memory.scope == scope and _same(h.memory.content, fact.content)), None)

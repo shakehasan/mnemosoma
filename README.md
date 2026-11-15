@@ -55,7 +55,9 @@ store.recall(ana, "where does ana work", as_of=june)   # -> "Ana works at Initec
 | **LangChain and LangGraph** | Retriever, agent tools, a drop-in LangGraph `BaseStore` and a multi-agent graph example |
 | **Observability** | Optional LangSmith traces of every write and recall |
 | **Async and thread-safe** | Awaitable API; the Rust engine releases Python's interpreter lock |
+| **Benchmarked on LongMemEval** | Retrieval measured on the public long-term memory benchmark, with the protocol published |
 | **Eval-gated CI** | A behaviour eval suite and a leak-checked load benchmark run on every push |
+| **Configurable, no magic numbers** | Every ranking and indexing parameter is a named, documented, validated setting |
 | **Cross-platform wheels** | A release pipeline builds wheels for Linux, macOS and Windows and tests them before publishing |
 | **Right to erasure** | Cascading delete that removes derived facts and rewrites the log |
 
@@ -78,7 +80,9 @@ Everything in this table is built and tested. What is not built yet is listed un
 - [LangChain, LangGraph and LangSmith](#langchain-langgraph-and-langsmith)
 - [MCP server](#mcp-server)
 - [Evaluation](#evaluation)
+- [LongMemEval benchmark](#longmemeval-benchmark)
 - [Capacity](#capacity)
+- [Configuration](#configuration)
 - [What is built and what is not](#what-is-built-and-what-is-not)
 - [Install and develop](#install-and-develop)
 - [Where this stands](#where-this-stands)
@@ -464,7 +468,45 @@ How to read this:
 
 - These scenarios test what the engine guarantees. They are generated, not taken from real conversations, and the retrieval rows use the built-in embedder, which matches words and spelling and not meaning. The heavily misspelled row shows its limit.
 - The suite was written alongside the engine and was used to tune it. It caught a real flaw: recently used memories were outranking better matches. Treat it as regression protection, not as an independent benchmark.
-- It does not measure end-to-end answer quality. LongMemEval and LoCoMo do that with a language model, and they have not been run.
+- It does not measure answer quality on real conversations. The next section does that for retrieval.
+
+## LongMemEval benchmark
+
+[LongMemEval](https://github.com/xiaowu0162/LongMemEval) (Wu et al., ICLR 2025) is a public benchmark for long-term chat memory. Each of its 500 questions comes with a history of about 48 timestamped chat sessions, and is labelled with the sessions that contain the answer. [`benchmarks/longmemeval.py`](benchmarks/longmemeval.py) measures retrieval: given only the question, does Mnemosoma return those sessions?
+
+Results on the `longmemeval_s` set, 470 questions, default settings, built-in embedder, no language model and no neural embedding model:
+
+| Indexed by | Metric | @1 | @3 | @5 | @10 |
+|---|---|---|---|---|---|
+| Round (a user message and its reply) | At least one evidence session found | 64.5% | 81.7% | 87.0% | 93.6% |
+| Round | Every evidence session found | 22.6% | 50.9% | 61.9% | 78.3% |
+| Round | NDCG | 64.5% | 65.2% | 68.6% | 73.5% |
+| Session (the whole conversation) | At least one evidence session found | 57.7% | 76.6% | 83.6% | 91.9% |
+| Session | Every evidence session found | 19.8% | 45.1% | 56.0% | 76.6% |
+| Session | NDCG | 57.7% | 58.9% | 62.8% | 68.7% |
+
+At least one evidence session found, by question type (indexed by round):
+
+| Question type | Questions | @1 | @5 | @10 |
+|---|---|---|---|---|
+| Knowledge update | 72 | 80.6% | 94.4% | 98.6% |
+| Multi-session | 121 | 59.5% | 90.9% | 95.9% |
+| Single session, assistant's words | 56 | 85.7% | 92.9% | 94.6% |
+| Single session, user's words | 64 | 67.2% | 87.5% | 95.3% |
+| Temporal reasoning | 127 | 60.6% | 84.3% | 92.1% |
+| Single session, preference | 30 | 16.7% | 53.3% | 73.3% |
+
+```bash
+python benchmarks/longmemeval.py --download
+```
+
+How to read this:
+
+- **Protocol.** For each question a fresh store is filled with that question's history and queried once with the question text. Nothing is tuned per question. The 30 abstention questions have no evidence session and are left out, as in the paper. The script, the dataset version and the settings are all in the repository, so the run can be repeated. It takes under four minutes on a laptop.
+- **What it shows.** With word and spelling matching alone, an answer-bearing session is in the top 10 for 93.6% of questions. Indexing by round beats indexing by whole session at every cut-off.
+- **Where it is weak.** Preference questions ask for advice that depends on something the user once mentioned, and share few words with it. That needs meaning-based matching. The script accepts `--embedder fastembed` to add a small local embedding model; it works, but a full run takes several hours on a laptop CPU and its results are not published here.
+- **What it does not show.** This is retrieval only. End-to-end answer accuracy needs a reader model and a judge on top, and has not been measured. No comparison with other systems is made here: published numbers for them use different models and settings.
+- **Data.** The dataset is the authors' cleaned release on Hugging Face (`xiaowu0162/longmemeval-cleaned`, MIT licence). It is downloaded to a local cache when the script runs and is not part of this repository.
 
 ## Capacity
 
@@ -493,6 +535,29 @@ What these numbers do and do not show:
 - The store is one process. Writers take turns behind one lock; multi-threaded write throughput has not been measured.
 - Durability is an append-only file with no fsync per write. Server mode and Postgres are not built.
 
+## Configuration
+
+Nothing that shapes behaviour is buried in the code. Every ranking and indexing parameter is a named field of the engine's `Tuning`, documented with what it trades off, checked when the store is created, and overridable one at a time:
+
+```python
+MemoryStore.default_tuning()
+# {"rrf_k": 60.0, "pool_factor": 4, "min_pool": 32, "bm25_k1": 1.2, "bm25_b": 0.75,
+#  "graph_seeds_per_ranker": 5, "graph_carry": 0.7, "graph_frontier": 16,
+#  "weight_trusted": 1.0, "weight_standard": 0.99, "weight_untrusted": 0.9,
+#  "weight_unconfirmed": 0.99, "salience_weight": 0.01,
+#  "ann_min_rows": 4096, "ann_min_share": 0.05, "ann_min_ef": 64, "ann_max_ef": 4096,
+#  "hnsw": {"m": 16, "ef_construction": 100}, "chars_per_token": 4}
+
+store = MemoryStore(
+    "change-me",
+    half_life_days=14,                 # how fast unused memories fade
+    required_corroborations=3,         # agents needed to confirm an inference
+    tuning={"graph_carry": 0.5, "hnsw": {"m": 32}},
+)
+```
+
+A value out of range, or a setting name that does not exist, is refused with the name of the setting. Role policies are configuration too (`policies=`). Defaults used by the Python layer, such as how many memories a tool returns, are named in [`mnemosoma/limits.py`](python/mnemosoma/limits.py). The published measurements all use the defaults.
+
 ## What is built and what is not
 
 | Area | Built and tested | Planned |
@@ -500,13 +565,14 @@ What these numbers do and do not show:
 | Engine | Scopes, role policies, grants, taint, bi-temporal chains, signed log, decay, TTL, erasure, columnar segments, inverted keyword index, filtered HNSW vector index with parallel build | Sharding across machines |
 | Retrieval | BM25, vector, entity match, rank fusion, graph expansion, token budget, point-in-time, explainable hits, pluggable reranker | Entity extraction at write time, learned reranker |
 | Safety | Trust tiers, signed provenance, injection guard, PII guard, review queue | Model-based injection detection |
-| Python | Typed SDK, async API, pluggable embedder, consolidator, prompt context | Streaming consolidation |
+| Python | Typed SDK with type stubs, async API, pluggable embedder, consolidator, prompt context, validated configuration | Streaming consolidation |
 | Integrations | LangChain retriever and tools, LangGraph `BaseStore`, LangGraph example, MCP server tested over stdio, optional LangSmith tracing | |
 | Storage | In-memory and single-file log | Postgres backend, server mode |
-| Evaluation | 29 engine tests, 32 SDK tests, behaviour eval suite, load benchmark | LongMemEval and LoCoMo runs under a published protocol |
+| Evaluation | 32 engine tests, 45 SDK tests, behaviour eval suite, load benchmark, LongMemEval retrieval benchmark | LongMemEval end-to-end answer accuracy, LoCoMo |
+| Code quality | `rustfmt`, Clippy with warnings as errors, Ruff and mypy, all enforced in CI | |
 | Packaging | CI on Linux, macOS and Windows; release pipeline for wheels on five platforms, source distribution and crate ([RELEASING.md](RELEASING.md)) | First release to PyPI and crates.io |
 
-No end-to-end answer-quality benchmark has been run yet. This README makes no claim about LongMemEval or LoCoMo, and it will not until the results come from a run anyone can repeat. LangSmith tracing has been tested only with tracing switched off.
+End-to-end answer accuracy has not been measured: the LongMemEval numbers above are for retrieval. LangSmith tracing has been tested only with tracing switched off.
 
 ## Install and develop
 
@@ -546,6 +612,7 @@ crates/mnemosoma-py/     PyO3 bindings
 python/mnemosoma/        SDK, consolidation, guards, context, LangChain, LangGraph store, MCP server, tracing
 examples/                LangGraph multi-agent example
 evals/                   Behaviour eval suite
+benchmarks/              LongMemEval retrieval benchmark
 tests/                   Python tests
 ```
 
@@ -553,7 +620,7 @@ tests/                   Python tests
 
 Agent memory in 2026 is good at one agent remembering one user. The open work is memory that many agents and many users share safely: who may read what, which version of a fact was true when, how far to trust a memory given where it came from, and how to forget on request.
 
-Mnemosoma puts those four questions inside the engine, tests each one, and gates every change on an eval suite. As of November 2026, we believe that combination could be the strongest open design for memory in multi-agent, multi-user systems. That is a claim about the design. The engine behaviour is tested and the capacity and evaluation numbers above are measured; the answer-quality benchmarks that would test the claim against other systems have not been run yet, and they are next.
+Mnemosoma puts those four questions inside the engine, tests each one, and gates every change on an eval suite. As of November 2026, we believe that combination could be the strongest open design for memory in multi-agent, multi-user systems. That is a claim about the design. The engine behaviour is tested, and the capacity, evaluation and LongMemEval retrieval numbers above are measured and repeatable. End-to-end answer accuracy, and a like-for-like comparison with other systems, have not been measured yet.
 
 ## Sources
 
@@ -565,6 +632,7 @@ Design choices here draw on published work. Most of it is 2026 preprints and pra
 - [Engram: bi-temporal knowledge graph memory with salience decay](https://www.alphaxiv.org/abs/2606.09900v1)
 - [Human-Inspired Memory Architecture for LLM Agents](https://arxiv.org/pdf/2605.08538)
 - [Provenance-capped poisoning defense for agent memory](https://arxiv.org/pdf/2606.22030)
+- [LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory](https://github.com/xiaowu0162/LongMemEval) (Wu et al., ICLR 2025)
 - OWASP Top 10 for Agentic Applications 2026, ASI06: Memory and Context Poisoning
 
 ## License

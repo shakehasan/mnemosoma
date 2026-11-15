@@ -27,8 +27,26 @@ T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 DAY = timedelta(days=1)
 
 PEOPLE = [
-    "Ana", "Bo", "Chidi", "Dana", "Emeka", "Farah", "Goran", "Hana", "Idris", "Jun",
-    "Kavya", "Luca", "Mina", "Noor", "Otto", "Priya", "Quinn", "Rosa", "Sven", "Tariq",
+    "Ana",
+    "Bo",
+    "Chidi",
+    "Dana",
+    "Emeka",
+    "Farah",
+    "Goran",
+    "Hana",
+    "Idris",
+    "Jun",
+    "Kavya",
+    "Luca",
+    "Mina",
+    "Noor",
+    "Otto",
+    "Priya",
+    "Quinn",
+    "Rosa",
+    "Sven",
+    "Tariq",
 ]
 ATTRIBUTES = {
     "employer": ["Initech", "Hooli", "Globex", "Umbrella", "Stark", "Wayne", "Tyrell", "Aperture"],
@@ -37,16 +55,54 @@ ATTRIBUTES = {
     "laptop": ["ThinkPad", "MacBook", "Framework", "Latitude", "Surface", "Zenbook", "Gram", "Spectre"],
     "diet": ["vegetarian", "vegan", "halal", "kosher", "pescatarian", "omnivore", "celiac", "keto"],
 }
-WORDS = (
-    "venue contract invoice launch budget deadline customer refund shipment meeting roadmap pricing "
-    "renewal outage report design hiring travel catering review migration release audit forecast "
-    "onboarding feedback warranty delivery campaign inventory policy training supplier warehouse "
-    "licence tender prototype survey workshop payroll"
-).split()
+WORDS = [
+    "venue",
+    "contract",
+    "invoice",
+    "launch",
+    "budget",
+    "deadline",
+    "customer",
+    "refund",
+    "shipment",
+    "meeting",
+    "roadmap",
+    "pricing",
+    "renewal",
+    "outage",
+    "report",
+    "design",
+    "hiring",
+    "travel",
+    "catering",
+    "review",
+    "migration",
+    "release",
+    "audit",
+    "forecast",
+    "onboarding",
+    "feedback",
+    "warranty",
+    "delivery",
+    "campaign",
+    "inventory",
+    "policy",
+    "training",
+    "supplier",
+    "warehouse",
+    "licence",
+    "tender",
+    "prototype",
+    "survey",
+    "workshop",
+    "payroll",
+]
 ROLES = ["planner", "researcher", "executor", "reviewer"]
 
 
-def agent(user: str, role: str = "researcher", *, tenant: str = "acme", name: str | None = None, team: str = "t0") -> Identity:
+def agent(
+    user: str, role: str = "researcher", *, tenant: str = "acme", name: str | None = None, team: str = "t0"
+) -> Identity:
     return Identity(tenant=tenant, user=user, agent=name or f"{role}-{user}", role=role, team=team)
 
 
@@ -87,7 +143,7 @@ def knowledge_and_time(rng: random.Random) -> dict[str, float]:
         question = f"what is {person}'s {attribute}"
         answer = top(store, me, question, k=1, now=now)
         current += answer == [f"{person}'s {attribute} is {history[-1][1]}"]
-        for (start, value), following in zip(history, history[1:] + [(None, None)]):
+        for (start, value), following in zip(history, [*history[1:], (None, None)], strict=True):
             end = following[0] or start + DAY * 10
             moment = start + (end - start) / 2
             answer = top(store, me, question, k=1, as_of=moment, now=now)
@@ -204,7 +260,9 @@ def sharing(rng: random.Random) -> dict[str, float]:
             owner, f"project {code} ships in March", scope=Scope.user(owner.user), tags=["shared"], now=T0
         )
         store.write(owner, f"project {code} private worry", scope=Scope.user(owner.user), now=T0)
-        find = lambda who: top(store, who, f"project {code}", now=T0 + DAY)  # noqa: E731
+
+        def find(who: Identity, store: MemoryStore = store, code: str = code) -> list[str]:
+            return top(store, who, f"project {code}", now=T0 + DAY)
 
         steps = [find(guest) == [] and find(outsider) == []]
         grant = store.grant(owner, guest.user, tag=tag)
@@ -258,13 +316,22 @@ def poisoning(rng: random.Random) -> dict[str, float]:
     for case in range(100):
         number = 2000 + case
         web = labelled.write(
-            me, rng.choice(INJECTIONS).format(n=number), scope=team, kind="episodic",
-            trust="untrusted", source="web", now=T0,
+            me,
+            rng.choice(INJECTIONS).format(n=number),
+            scope=team,
+            kind="episodic",
+            trust="untrusted",
+            source="web",
+            now=T0,
         )
         # An agent restates it as its own trusted fact.
         labelled.write(
-            me, f"The payee is account {number}", scope=team, trust="trusted",
-            derived_from=[web], now=T0,
+            me,
+            f"The payee is account {number}",
+            scope=team,
+            trust="trusted",
+            derived_from=[web],
+            now=T0,
         )
         hits = top(labelled, me, f"payee account {number}", k=10, now=T0)
         exposed += any(str(number) in text for text in hits)
@@ -328,7 +395,7 @@ def retrieval(rng: random.Random) -> dict[str, float]:
     out = {}
     queries = {
         "exact": lambda w: " ".join(w),
-        "one_typo": lambda w: " ".join([typo(w[0], rng)] + w[1:]),
+        "one_typo": lambda w: " ".join([typo(w[0], rng), *w[1:]]),
         "all_typos": lambda w: " ".join(typo(x, rng) for x in w),
         "partial": lambda w: " ".join(w[:3]),
     }
@@ -366,7 +433,9 @@ def multi_hop(rng: random.Random) -> dict[str, float]:
     def found(hops: int) -> float:
         hit = 0
         for project, answer in cases:
-            ids = [h.memory.id for h in store.recall(me, f"where is the lead of {project}", k=5, graph_hops=hops, now=T0)]
+            ids = [
+                h.memory.id for h in store.recall(me, f"where is the lead of {project}", k=5, graph_hops=hops, now=T0)
+            ]
             hit += answer in ids
         return hit / len(cases)
 

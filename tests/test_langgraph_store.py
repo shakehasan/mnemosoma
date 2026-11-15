@@ -7,7 +7,6 @@ pytest.importorskip("langgraph")
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.store.base import BaseStore
-
 from mnemosoma import Identity, MemoryStore, Scope, injection_guard
 from mnemosoma.langgraph_store import MnemosomaStore
 

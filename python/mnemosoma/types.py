@@ -21,11 +21,18 @@ def to_ms(moment: Moment | None) -> int | None:
         return moment
     if moment.tzinfo is None:
         raise ValueError("datetimes must be timezone-aware")
-    return int(moment.timestamp() * 1000)
+    return int(moment.timestamp() * MS_PER_SECOND)
+
+
+MS_PER_SECOND = 1000
+
+
+def moment_from_ms(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / MS_PER_SECOND, tz=timezone.utc)
 
 
 def from_ms(ms: int | None) -> datetime | None:
-    return None if ms is None else datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return None if ms is None else moment_from_ms(ms)
 
 
 def duration_ms(duration: timedelta | float | None) -> int | None:
@@ -33,7 +40,7 @@ def duration_ms(duration: timedelta | float | None) -> int | None:
     if duration is None:
         return None
     seconds = duration.total_seconds() if isinstance(duration, timedelta) else float(duration)
-    return int(seconds * 1000)
+    return int(seconds * MS_PER_SECOND)
 
 
 @dataclass(frozen=True)
@@ -137,9 +144,9 @@ class Memory:
             trust=d["trust"],
             derived_from=tuple(d.get("derived_from", ())),
             corroborated_by=tuple(d.get("corroborated_by", ())),
-            valid_from=from_ms(d["valid_from"]),
+            valid_from=moment_from_ms(d["valid_from"]),
             valid_to=from_ms(d.get("valid_to")),
-            recorded_at=from_ms(d["recorded_at"]),
+            recorded_at=moment_from_ms(d["recorded_at"]),
             superseded_by=d.get("superseded_by"),
             expires_at=from_ms(d.get("expires_at")),
             salience=d["salience"],

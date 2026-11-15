@@ -9,14 +9,18 @@ acceptable.
 
 from __future__ import annotations
 
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 F = TypeVar("F", bound=Callable[..., Any])
 
+_traceable: Callable[..., Any] | None
 try:
-    from langsmith import traceable as _traceable
+    from langsmith import traceable as _langsmith_traceable
 except ImportError:  # langsmith is optional
     _traceable = None
+else:
+    _traceable = _langsmith_traceable
 
 
 def _without_self(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -29,6 +33,7 @@ def traced(name: str, run_type: str) -> Callable[[F], F]:
     def decorate(fn: F) -> F:
         if _traceable is None:
             return fn
-        return _traceable(name=name, run_type=run_type, process_inputs=_without_self)(fn)
+        wrapped: F = _traceable(name=name, run_type=run_type, process_inputs=_without_self)(fn)
+        return wrapped
 
     return decorate

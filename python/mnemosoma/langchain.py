@@ -8,7 +8,8 @@ The model chooses what to remember or look up; it never chooses who it is.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
@@ -16,6 +17,7 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import limits
 from .consolidation import Extractor, Fact
 from .store import MemoryStore
 from .types import Hit, Identity, Kind, Memory, Scope, Trust
@@ -51,7 +53,7 @@ class MnemosomaRetriever(BaseRetriever):
 
     store: Any
     identity: Identity
-    k: int = 8
+    k: int = limits.DEFAULT_RECALL_K
     token_budget: int | None = None
     kinds: list[Kind] = Field(default_factory=list)
     min_trust: Trust = "standard"
@@ -86,8 +88,8 @@ def memory_tools(
     identity: Identity,
     *,
     write_scope: Scope,
-    k: int = 5,
-    token_budget: int | None = 800,
+    k: int = limits.DEFAULT_TOOL_RECALL_K,
+    token_budget: int | None = limits.DEFAULT_CONTEXT_TOKENS,
 ) -> list[BaseTool]:
     """``remember`` and ``recall`` tools for an agent, bound to ``identity``.
 

@@ -11,8 +11,9 @@ checks; they do not replace them.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Literal
 
 from .types import Trust
 
@@ -27,7 +28,7 @@ class Draft:
     source: str
 
 
-class GuardBlocked(ValueError):
+class GuardBlockedError(ValueError):
     """Raised by a guard to refuse a write."""
 
 
@@ -101,7 +102,7 @@ def pii_guard(mode: Literal["tag", "redact", "block"] = "redact") -> Guard:
         scrub(_CARD, "card", _luhn)
         scrub(_PHONE, "phone")
         if found and mode == "block":
-            raise GuardBlocked(f"write refused: contains {', '.join(sorted(set(found)))}")
+            raise GuardBlockedError(f"write refused: contains {', '.join(sorted(set(found)))}")
         for label in sorted(set(found)):
             if f"pii:{label}" not in draft.tags:
                 draft.tags.append(f"pii:{label}")
