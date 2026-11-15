@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any
 
-from . import _core
+from . import _core, limits
 from .context import render_context
 from .guards import Draft, Guard
 from .tracing import traced
@@ -31,10 +32,6 @@ Embedder = Callable[[str], Sequence[float]]
 Reranker = Callable[[str, Sequence[str]], Sequence[float]]
 
 
-def _token_cost(text: str) -> int:
-    return len(text.encode()) // 4 + 1
-
-
 class MemoryStore:
     """Shared memory for many agents and users.
 
@@ -47,7 +44,14 @@ class MemoryStore:
             out of the log file's directory.
         path: Log file to persist to. ``None`` keeps everything in memory.
         half_life_days: Salience halves after this long without a recall.
-        archive_below: ``sweep`` archives episodes whose salience decays below this.
+            Defaults to the engine's 30 days.
+        archive_below: ``sweep`` archives episodes whose salience decays below
+            this. Defaults to the engine's 0.05.
+        required_corroborations: How many other agents must corroborate an
+            inference before it counts as established. Defaults to 2.
+        tuning: Overrides for the engine's ranking and indexing parameters,
+            for example ``{"rrf_k": 30, "graph_carry": 0.5}``. Anything left
+            out keeps its default; :meth:`default_tuning` lists them all.
         policies: Replace the default role policies. Maps a role name to
             ``{"read": [...], "write": [...], "can_promote": bool}``.
         embedder: Turns text into a vector, for semantic recall. Any function
@@ -64,8 +68,10 @@ class MemoryStore:
         signing_key: str | bytes,
         path: str | Path | None = None,
         *,
-        half_life_days: float = 30.0,
-        archive_below: float = 0.05,
+        half_life_days: float | None = None,
+        archive_below: float | None = None,
+        required_corroborations: int | None = None,
+        tuning: dict[str, Any] | None = None,
         policies: dict[str, dict[str, Any]] | None = None,
         embedder: Embedder | None = None,
         reranker: Reranker | None = None,
@@ -78,10 +84,21 @@ class MemoryStore:
             half_life_days,
             archive_below,
             None if policies is None else json.dumps(policies),
+            None if tuning is None else json.dumps(tuning),
+            required_corroborations,
         )
+        self._chars_per_token: int = {**self.default_tuning(), **(tuning or {})}["chars_per_token"]
         self._embedder = embedder
         self._reranker = reranker
         self._guards = tuple(guards)
+
+    @staticmethod
+    def default_tuning() -> dict[str, Any]:
+        """The engine's default ranking and indexing parameters."""
+        return json.loads(_core.default_tuning())
+
+    def _token_cost(self, text: str) -> int:
+        return len(text.encode()) // self._chars_per_token + 1
 
     def _embed(self, text: str, given: Sequence[float] | None) -> list[float] | None:
         if given is not None:
@@ -122,7 +139,7 @@ class MemoryStore:
         Raises:
             PermissionError: The caller's role may not write to ``scope``, or
                 ``derived_from`` names a memory the caller cannot read.
-            GuardBlocked: A guard refused the write.
+            GuardBlockedError: A guard refused the write.
         """
         draft = Draft(content=content, trust=trust, tags=list(tags), source=source)
         for guard in self._guards:
@@ -151,7 +168,7 @@ class MemoryStore:
         who: Identity,
         text: str = "",
         *,
-        k: int = 8,
+        k: int = limits.DEFAULT_RECALL_K,
         token_budget: int | None = None,
         kinds: Iterable[Kind] = (),
         scopes: Iterable[ScopeKind] = (),
@@ -179,7 +196,7 @@ class MemoryStore:
         query = {
             "text": text,
             "embedding": self._embed(text, embedding),
-            "k": max(k * 4, 20) if rerank else k,
+            "k": max(k * limits.RERANK_POOL_FACTOR, limits.RERANK_MIN_POOL) if rerank else k,
             "token_budget": None if rerank else token_budget,
             "kinds": list(kinds),
             "scopes": list(scopes),
@@ -194,6 +211,7 @@ class MemoryStore:
         if not rerank or not hits:
             return hits
 
+        assert self._reranker is not None
         scores = list(self._reranker(text, [h.memory.content for h in hits]))
         if len(scores) != len(hits):
             raise ValueError(f"reranker returned {len(scores)} scores for {len(hits)} texts")
@@ -203,14 +221,21 @@ class MemoryStore:
         for i in order:
             if len(picked) >= k:
                 break
-            cost = _token_cost(hits[i].memory.content)
+            cost = self._token_cost(hits[i].memory.content)
             if token_budget is not None and used + cost > token_budget:
                 continue
             used += cost
             picked.append(replace(hits[i], score=float(scores[i])))
         return picked
 
-    def context(self, who: Identity, text: str, *, token_budget: int = 800, **recall_options: Any) -> str:
+    def context(
+        self,
+        who: Identity,
+        text: str,
+        *,
+        token_budget: int = limits.DEFAULT_CONTEXT_TOKENS,
+        **recall_options: Any,
+    ) -> str:
         """Recall for ``text`` and render the result as a block of prompt context.
 
         The block groups memories into established, unconfirmed and untrusted,
@@ -219,13 +244,16 @@ class MemoryStore:
         """
         return render_context(self.recall(who, text, token_budget=token_budget, **recall_options))
 
-    def pending_review(self, who: Identity, *, limit: int = 50, now: Moment | None = None) -> list[Hit]:
+    def pending_review(
+        self, who: Identity, *, limit: int = limits.DEFAULT_REVIEW_LIMIT, now: Moment | None = None
+    ) -> list[Hit]:
         """Inferences the caller can read that nobody has confirmed yet, newest first.
 
         This is the queue for a human or a curator agent: confirm an item with
         :meth:`corroborate`, or remove it with :meth:`forget`.
         """
-        hits = self.recall(who, kinds=["semantic"], k=max(limit * 4, 200), now=now)
+        scan = max(limit * limits.REVIEW_SCAN_FACTOR, limits.REVIEW_MIN_SCAN)
+        hits = self.recall(who, kinds=["semantic"], k=scan, now=now)
         return [h for h in hits if not h.established][:limit]
 
     def get(self, who: Identity, memory_id: int, *, now: Moment | None = None) -> Memory:

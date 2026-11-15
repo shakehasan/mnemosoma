@@ -1,7 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from mnemosoma import Consolidator, Fact, Identity, MemoryStore, Scope
 
 T0 = datetime(2026, 11, 1, tzinfo=timezone.utc)
@@ -95,13 +94,15 @@ def test_custom_embedder_is_used_for_both_sides():
 
 
 def test_naive_datetimes_are_rejected(store):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="timezone-aware"):
         store.write(ANA, "x", scope=Scope.agent("r1"), now=datetime(2026, 1, 1))
 
 
 def test_consolidation_links_facts_to_their_episodes(store):
     team = Scope.team("task-1")
-    e1 = store.write(ANA, "Call with Dana: she confirmed the venue holds 80 people", scope=team, kind="episodic", now=T0)
+    e1 = store.write(
+        ANA, "Call with Dana: she confirmed the venue holds 80 people", scope=team, kind="episodic", now=T0
+    )
     store.write(ANA, "Small talk about the weather", scope=team, kind="episodic", now=T0)
 
     def extractor(episodes):

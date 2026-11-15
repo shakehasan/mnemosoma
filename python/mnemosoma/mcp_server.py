@@ -30,8 +30,9 @@ import os
 try:  # mcp 2.x
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp 1.x, where the same class is called FastMCP
-    from mcp.server.fastmcp import FastMCP as MCPServer
+    from mcp.server.fastmcp import FastMCP as MCPServer  # type: ignore[attr-defined,no-redef]
 
+from . import limits
 from .guards import injection_guard
 from .store import MemoryStore
 from .types import Identity, Scope
@@ -66,9 +67,10 @@ def build_server(store: MemoryStore, identity: Identity, *, write_scope: Scope, 
         return f"Saved as memory {memory_id}."
 
     @server.tool()
-    def recall(query: str, k: int = 5) -> str:
+    def recall(query: str, k: int = limits.DEFAULT_TOOL_RECALL_K) -> str:
         """Search long-term memory and return what is relevant, with its source and reliability."""
-        return store.context(identity, query, k=max(1, min(k, 20))) or "No relevant memories."
+        wanted = max(1, min(k, limits.MAX_TOOL_RECALL_K))
+        return store.context(identity, query, k=wanted) or "No relevant memories."
 
     @server.tool()
     def history(subject: str) -> str:
@@ -77,8 +79,7 @@ def build_server(store: MemoryStore, identity: Identity, *, write_scope: Scope, 
         if not versions:
             return f"No memory with subject {subject!r}."
         return "\n".join(
-            f"- {m.content} (from {m.valid_from:%Y-%m-%d}"
-            f"{f' to {m.valid_to:%Y-%m-%d}' if m.valid_to else ', current'})"
+            f"- {m.content} (from {m.valid_from:%Y-%m-%d}{f' to {m.valid_to:%Y-%m-%d}' if m.valid_to else ', current'})"
             for m in versions
         )
 

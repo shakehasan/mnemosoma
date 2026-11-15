@@ -27,9 +27,11 @@ How LangGraph's model maps onto Mnemosoma:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Any, Iterable
+from typing import Any
 
 from langgraph.store.base import (
     BaseStore,
@@ -44,11 +46,11 @@ from langgraph.store.base import (
     SearchOp,
 )
 
+from . import limits
 from .store import MemoryStore
 from .types import Identity, Memory, Scope
 
 _PREFIX_TAG = "lg-prefix:"
-_SEARCH_POOL = 10_000
 
 
 def _subject(namespace: tuple[str, ...], key: str) -> str:
@@ -63,7 +65,9 @@ def _parse_subject(subject: str | None) -> tuple[tuple[str, ...], str] | None:
 
 
 def _prefix_tags(namespace: tuple[str, ...]) -> list[str]:
-    return [_PREFIX_TAG + json.dumps(list(namespace[:depth]), ensure_ascii=False) for depth in range(len(namespace) + 1)]
+    return [
+        _PREFIX_TAG + json.dumps(list(namespace[:depth]), ensure_ascii=False) for depth in range(len(namespace) + 1)
+    ]
 
 
 def _matches(value: dict[str, Any], conditions: dict[str, Any] | None) -> bool:
@@ -75,7 +79,7 @@ def _path_matches(namespace: tuple[str, ...], condition: MatchCondition) -> bool
     if len(path) > len(namespace):
         return False
     part = namespace[: len(path)] if condition.match_type == "prefix" else namespace[len(namespace) - len(path) :]
-    return all(want == "*" or want == got for want, got in zip(path, part))
+    return all(want in ("*", got) for want, got in zip(path, part, strict=True))
 
 
 class MnemosomaStore(BaseStore):
@@ -123,10 +127,9 @@ class MnemosomaStore(BaseStore):
         namespace = tuple(op.namespace)
         if op.value is None:
             for version in self.memory.history(self.identity, self.scope, _subject(namespace, op.key)):
-                try:
+                # A version may already be gone, erased along with an earlier one.
+                with contextlib.suppress(KeyError):
                     self.memory.forget(self.identity, version.id)
-                except KeyError:
-                    pass  # Already removed along with an earlier version.
             return
         self.memory.write(
             self.identity,
@@ -135,7 +138,7 @@ class MnemosomaStore(BaseStore):
             subject=_subject(namespace, op.key),
             tags=_prefix_tags(namespace),
             source="langgraph-store",
-            ttl=None if op.ttl is None else op.ttl * 60,
+            ttl=None if op.ttl is None else op.ttl * limits.SECONDS_PER_MINUTE,
         )
 
     def _search(self, op: SearchOp) -> list[SearchItem]:
@@ -143,7 +146,7 @@ class MnemosomaStore(BaseStore):
         hits = self.memory.recall(
             self.identity,
             op.query or "",
-            k=_SEARCH_POOL,
+            k=limits.SCAN_LIMIT,
             kinds=["semantic"],
             scopes=[self.scope.kind],
         )
@@ -172,7 +175,7 @@ class MnemosomaStore(BaseStore):
         return results[op.offset : op.offset + op.limit]
 
     def _list_namespaces(self, op: ListNamespacesOp) -> list[tuple[str, ...]]:
-        hits = self.memory.recall(self.identity, k=_SEARCH_POOL, kinds=["semantic"], scopes=[self.scope.kind])
+        hits = self.memory.recall(self.identity, k=limits.SCAN_LIMIT, kinds=["semantic"], scopes=[self.scope.kind])
         seen: set[tuple[str, ...]] = set()
         for hit in hits:
             parsed = _parse_subject(hit.memory.subject)
@@ -191,7 +194,8 @@ class MnemosomaStore(BaseStore):
             if isinstance(op, GetOp):
                 results.append(self._get(op))
             elif isinstance(op, PutOp):
-                results.append(self._put(op))
+                self._put(op)
+                results.append(None)
             elif isinstance(op, SearchOp):
                 results.append(self._search(op))
             elif isinstance(op, ListNamespacesOp):

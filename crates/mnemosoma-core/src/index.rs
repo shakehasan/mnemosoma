@@ -66,16 +66,21 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Dot product, written so the compiler can vectorise it.
+/// Lanes summed independently in [`dot`], so the compiler can vectorise it.
+const DOT_LANES: usize = 8;
+
+/// Dot product of two equal-length vectors.
+#[must_use]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut lanes = [0f32; 8];
-    let (a8, b8) = (a.chunks_exact(8), b.chunks_exact(8));
-    let tail: f32 = a8.remainder().iter().zip(b8.remainder()).map(|(x, y)| x * y).sum();
-    for (x, y) in a8.zip(b8) {
-        for i in 0..8 {
-            lanes[i] += x[i] * y[i];
+    let (a_chunks, a_tail) = a.as_chunks::<DOT_LANES>();
+    let (b_chunks, b_tail) = b.as_chunks::<DOT_LANES>();
+    let mut lanes = [0f32; DOT_LANES];
+    for (x, y) in a_chunks.iter().zip(b_chunks) {
+        for ((lane, p), q) in lanes.iter_mut().zip(x).zip(y) {
+            *lane += p * q;
         }
     }
+    let tail: f32 = a_tail.iter().zip(b_tail).map(|(p, q)| p * q).sum();
     lanes.iter().sum::<f32>() + tail
 }
 
@@ -97,13 +102,14 @@ pub fn sort_desc(v: &mut [(u64, f32)]) {
     v.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
 }
 
-/// Reciprocal rank fusion. Each ranking is a best-first list of ids.
-pub fn rrf(rankings: &[Vec<u64>]) -> HashMap<u64, f32> {
-    const K: f32 = 60.0;
+/// Reciprocal rank fusion. Each ranking is a best-first list of ids; `k`
+/// controls how quickly credit falls off with rank.
+#[must_use]
+pub fn rrf(rankings: &[Vec<u64>], k: f32) -> HashMap<u64, f32> {
     let mut fused = HashMap::new();
     for ranking in rankings {
         for (rank, id) in ranking.iter().enumerate() {
-            *fused.entry(*id).or_insert(0.0) += 1.0 / (K + rank as f32 + 1.0);
+            *fused.entry(*id).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
         }
     }
     fused

@@ -2,10 +2,9 @@ import asyncio
 from datetime import datetime, timezone
 
 import pytest
-
 from mnemosoma import (
     AsyncMemoryStore,
-    GuardBlocked,
+    GuardBlockedError,
     Identity,
     MemoryStore,
     Scope,
@@ -85,7 +84,7 @@ def test_pii_guard_modes():
     assert kept.content == text and "pii:email" in kept.tags
 
     blocking = MemoryStore("k", guards=[pii_guard("block")])
-    with pytest.raises(GuardBlocked):
+    with pytest.raises(GuardBlockedError):
         blocking.write(ANA, text, scope=TEAM, now=T0)
     blocking.write(ANA, "Nothing sensitive here", scope=TEAM, now=T0)
 
@@ -166,7 +165,13 @@ def test_mcp_server_tools():
         names = sorted(tool.name for tool in await server.list_tools())
         saved = await call("remember", content="Ana works at Initech", subject="ana/employer")
         await call("remember", content="Ana works at Hooli", subject="ana/employer")
-        return names, saved, await call("recall", query="where does ana work"), await call("history", subject="ana/employer"), await call("forget", memory_id=1)
+        return (
+            names,
+            saved,
+            await call("recall", query="where does ana work"),
+            await call("history", subject="ana/employer"),
+            await call("forget", memory_id=1),
+        )
 
     names, saved, recalled, history, forgotten = asyncio.run(scenario())
     assert names == ["forget", "history", "recall", "remember"]

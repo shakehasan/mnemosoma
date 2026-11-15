@@ -24,7 +24,7 @@ dependencies = []
 langchain = ["langchain-core>=1.0", "langgraph>=1.0"]
 tracing = ["langsmith>=0.4"]
 mcp = ["mcp>=1.2"]
-dev = ["pytest>=8", "langchain-core>=1.0", "langgraph>=1.0", "langsmith>=0.4", "mcp>=1.2"]
+dev = ["pytest>=8", "langchain-core>=1.0", "langgraph>=1.0", "langsmith>=0.4", "mcp>=1.2", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]
 mnemosoma-mcp = "mnemosoma.mcp_server:main"
@@ -39,3 +39,20 @@ module-name = "mnemosoma._core"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PT", "N"]
+# Tests assert several related facts about one result in a single statement.
+ignore = ["PT018"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["python/mnemosoma"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true

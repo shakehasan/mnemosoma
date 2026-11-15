@@ -12,13 +12,37 @@
 //! returned, it is only stepped over.
 
 use crate::index::dot;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-const M: usize = 16;
-const M0: usize = 2 * M;
-const EF_CONSTRUCTION: usize = 100;
+/// Highest layer a node can be placed on. With the default link count this
+/// is never reached below billions of nodes; it only bounds memory use.
+const MAX_LEVEL: usize = 16;
+/// Seed for the level generator, so the same inserts build the same graph.
+const LEVEL_SEED: u64 = 0x2545_F491_4F6C_DD1D;
+
+/// Shape of the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HnswParams {
+    /// Links per node on upper layers; the bottom layer allows twice as
+    /// many. More links give better recall and a larger, slower-built graph.
+    pub m: usize,
+    /// Candidate list size while inserting. Larger builds a better graph,
+    /// more slowly.
+    pub ef_construction: usize,
+}
+
+impl Default for HnswParams {
+    fn default() -> Self {
+        Self {
+            m: 16,
+            ef_construction: 100,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 struct Near {
@@ -28,7 +52,9 @@ struct Near {
 impl Eq for Near {}
 impl Ord for Near {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.sim.total_cmp(&other.sim).then(other.node.cmp(&self.node))
+        self.sim
+            .total_cmp(&other.sim)
+            .then(other.node.cmp(&self.node))
     }
 }
 impl PartialOrd for Near {
@@ -83,6 +109,7 @@ impl Visited {
 
 #[derive(Default)]
 pub struct Hnsw {
+    params: HnswParams,
     /// `links[node][level]` holds the node's neighbours on that level.
     links: Vec<Vec<Vec<u32>>>,
     entry: Option<u32>,
@@ -97,12 +124,22 @@ fn vector(data: &[f32], dim: usize, node: u32) -> &[f32] {
 }
 
 impl Hnsw {
+    #[must_use]
+    pub fn new(params: HnswParams) -> Self {
+        Self {
+            params,
+            ..Self::default()
+        }
+    }
+
     /// Number of nodes in the graph. Nodes are numbered from zero in the
     /// order they were inserted.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.links.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.links.is_empty()
     }
@@ -110,15 +147,16 @@ impl Hnsw {
     fn random_level(&mut self) -> usize {
         // xorshift64*, seeded deterministically so builds are repeatable.
         if self.seed == 0 {
-            self.seed = 0x2545_F491_4F6C_DD1D;
+            self.seed = LEVEL_SEED;
         }
         self.seed ^= self.seed >> 12;
         self.seed ^= self.seed << 25;
         self.seed ^= self.seed >> 27;
-        let bits = self.seed.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let bits = self.seed.wrapping_mul(LEVEL_SEED);
         let uniform = ((bits >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
-        let level = (-uniform.ln() / (M as f64).ln()).floor() as usize;
-        level.min(16)
+        let m = self.params.m.max(2) as f64;
+        let level = (-uniform.ln() / m.ln()).floor() as usize;
+        level.min(MAX_LEVEL)
     }
 
     /// Add the next node. `data` must already hold its vector at position
@@ -133,29 +171,50 @@ impl Hnsw {
             return;
         };
         let query = vector(data, dim, node);
-        let mut nearest = Near { sim: dot(query, vector(data, dim, entry)), node: entry };
+        let mut nearest = Near {
+            sim: dot(query, vector(data, dim, entry)),
+            node: entry,
+        };
         for layer in (level + 1..=self.top_level).rev() {
             nearest = self.greedy(query, data, dim, nearest, layer);
         }
         let mut entries = vec![nearest];
         for layer in (0..=level.min(self.top_level)).rev() {
-            let found = self.search_layer(query, data, dim, &entries, EF_CONSTRUCTION, layer, &|_| true);
-            let limit = if layer == 0 { M0 } else { M };
-            let chosen = select(&found, data, dim, M);
+            let found = self.search_layer(
+                query,
+                data,
+                dim,
+                &entries,
+                self.params.ef_construction,
+                layer,
+                &|_| true,
+            );
+            let limit = if layer == 0 {
+                2 * self.params.m
+            } else {
+                self.params.m
+            };
+            let chosen = select(&found, data, dim, self.params.m);
             self.links[node as usize][layer] = chosen.iter().map(|n| n.node).collect();
             for neighbour in &chosen {
                 let list = &mut self.links[neighbour.node as usize][layer];
                 list.push(node);
                 if list.len() > limit {
                     let base = vector(data, dim, neighbour.node);
-                    let mut candidates: Vec<Near> =
-                        list.iter().map(|n| Near { sim: dot(base, vector(data, dim, *n)), node: *n }).collect();
+                    let mut candidates: Vec<Near> = list
+                        .iter()
+                        .map(|n| Near {
+                            sim: dot(base, vector(data, dim, *n)),
+                            node: *n,
+                        })
+                        .collect();
                     // Keep the closest. Re-running the diversity heuristic here
                     // costs a full pairwise comparison per overflow, which made
                     // building large indexes several times slower.
                     candidates.sort_by(|a, b| b.cmp(a));
                     candidates.truncate(limit);
-                    self.links[neighbour.node as usize][layer] = candidates.iter().map(|n| n.node).collect();
+                    self.links[neighbour.node as usize][layer] =
+                        candidates.iter().map(|n| n.node).collect();
                 }
             }
             entries = found;
@@ -166,10 +225,21 @@ impl Hnsw {
         }
     }
 
-    fn greedy(&self, query: &[f32], data: &[f32], dim: usize, mut best: Near, layer: usize) -> Near {
+    fn greedy(
+        &self,
+        query: &[f32],
+        data: &[f32],
+        dim: usize,
+        mut best: Near,
+        layer: usize,
+    ) -> Near {
         loop {
             let mut moved = false;
-            for n in self.links[best.node as usize].get(layer).into_iter().flatten() {
+            for n in self.links[best.node as usize]
+                .get(layer)
+                .into_iter()
+                .flatten()
+            {
                 let sim = dot(query, vector(data, dim, *n));
                 if sim > best.sim {
                     best = Near { sim, node: *n };
@@ -216,15 +286,24 @@ impl Hnsw {
             walked.pop();
         }
         while let Some(current) = frontier.pop() {
-            if walked.len() >= width && walked.peek().is_some_and(|worst| current.sim < worst.0.sim) {
+            if walked.len() >= width && walked.peek().is_some_and(|worst| current.sim < worst.0.sim)
+            {
                 break;
             }
-            for n in self.links[current.node as usize].get(layer).into_iter().flatten() {
+            for n in self.links[current.node as usize]
+                .get(layer)
+                .into_iter()
+                .flatten()
+            {
                 if !visited.first_visit(*n) {
                     continue;
                 }
-                let near = Near { sim: dot(query, vector(data, dim, *n)), node: *n };
-                if walked.len() < width || walked.peek().is_some_and(|worst| near.sim > worst.0.sim) {
+                let near = Near {
+                    sim: dot(query, vector(data, dim, *n)),
+                    node: *n,
+                };
+                if walked.len() < width || walked.peek().is_some_and(|worst| near.sim > worst.0.sim)
+                {
                     frontier.push(near);
                     walked.push(Far(near));
                     if walked.len() > width {
@@ -255,8 +334,13 @@ impl Hnsw {
         ef: usize,
         accept: &dyn Fn(u32) -> bool,
     ) -> Vec<(u32, f32)> {
-        let Some(entry) = self.entry else { return vec![] };
-        let mut nearest = Near { sim: dot(query, vector(data, dim, entry)), node: entry };
+        let Some(entry) = self.entry else {
+            return vec![];
+        };
+        let mut nearest = Near {
+            sim: dot(query, vector(data, dim, entry)),
+            node: entry,
+        };
         for layer in (1..=self.top_level).rev() {
             nearest = self.greedy(query, data, dim, nearest, layer);
         }
@@ -276,7 +360,10 @@ fn select(candidates: &[Near], data: &[f32], dim: usize, limit: usize) -> Vec<Ne
             break;
         }
         let v = vector(data, dim, c.node);
-        if kept.iter().all(|k| dot(v, vector(data, dim, k.node)) < c.sim) {
+        if kept
+            .iter()
+            .all(|k| dot(v, vector(data, dim, k.node)) < c.sim)
+        {
             kept.push(*c);
         }
     }
@@ -313,7 +400,13 @@ mod tests {
         data
     }
 
-    fn exact(query: &[f32], data: &[f32], dim: usize, k: usize, accept: &dyn Fn(u32) -> bool) -> Vec<u32> {
+    fn exact(
+        query: &[f32],
+        data: &[f32],
+        dim: usize,
+        k: usize,
+        accept: &dyn Fn(u32) -> bool,
+    ) -> Vec<u32> {
         let mut all: Vec<(u32, f32)> = (0..(data.len() / dim) as u32)
             .filter(|n| accept(*n))
             .map(|n| (n, dot(query, vector(data, dim, n))))
@@ -333,8 +426,15 @@ mod tests {
         let mut hit = 0;
         for q in queries.chunks(dim) {
             let truth = exact(q, &data, dim, 10, filter);
-            let got: Vec<u32> = index.search(q, &data, dim, 10, ef, filter).into_iter().map(|x| x.0).collect();
-            assert!(got.iter().all(|n| filter(*n)), "a rejected node was returned");
+            let got: Vec<u32> = index
+                .search(q, &data, dim, 10, ef, filter)
+                .into_iter()
+                .map(|x| x.0)
+                .collect();
+            assert!(
+                got.iter().all(|n| filter(*n)),
+                "a rejected node was returned"
+            );
             hit += truth.iter().filter(|t| got.contains(t)).count();
         }
         hit as f32 / 1000.0
@@ -354,6 +454,8 @@ mod tests {
 
     #[test]
     fn empty_index_returns_nothing() {
-        assert!(Hnsw::default().search(&[1.0, 0.0], &[], 2, 5, 10, &|_| true).is_empty());
+        assert!(Hnsw::default()
+            .search(&[1.0, 0.0], &[], 2, 5, 10, &|_| true)
+            .is_empty());
     }
 }

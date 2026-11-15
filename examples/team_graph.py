@@ -23,7 +23,6 @@ from __future__ import annotations
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
-
 from mnemosoma import Identity, MemoryStore, Scope
 
 TEAM = Scope.team("dinner")
@@ -122,7 +121,9 @@ def main() -> list[str]:
 
     # A different user in the same company sees none of Ana's memory.
     bo = Identity(tenant="acme", user="bo", agent="assistant", role="researcher", team="offsite")
-    log.append(f"bo's agent: memories visible about the dinner -> {len(store.recall(bo, 'vegetarian restaurant dinner'))}")
+    log.append(
+        f"bo's agent: memories visible about the dinner -> {len(store.recall(bo, 'vegetarian restaurant dinner'))}"
+    )
     return log
 
 

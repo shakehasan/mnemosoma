@@ -6,14 +6,20 @@
 //! run before ranking, inside [`MemoryStore::recall`].
 
 pub mod ann;
+pub mod config;
 pub mod identity;
 pub mod index;
 pub mod memory;
 pub mod provenance;
 pub mod store;
 
+pub use ann::HnswParams;
+pub use config::Tuning;
 pub use identity::{default_roles, Grant, Identity, RolePolicy, Scope, ScopeKind};
-pub use memory::{Assertion, Memory, MemoryKind, NewMemory, Trust};
+pub use memory::{
+    Assertion, Memory, MemoryKind, NewMemory, Trust, APPROVED_PREFIX,
+    DEFAULT_REQUIRED_CORROBORATIONS,
+};
 pub use store::{now_ms, Error, Hit, MemoryStore, Query, Stats, StoreConfig, SweepReport, Why};
 
 /// Compiles the README example as a test.

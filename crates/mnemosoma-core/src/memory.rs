@@ -3,6 +3,11 @@
 use crate::identity::Scope;
 use serde::{Deserialize, Serialize};
 
+/// Independent corroborations that establish an inference by default.
+pub const DEFAULT_REQUIRED_CORROBORATIONS: usize = 2;
+/// Marks a corroboration made by a role allowed to approve on its own.
+pub const APPROVED_PREFIX: &str = "approved:";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
@@ -90,12 +95,23 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// An inferred memory counts as established once two other agents have
-    /// corroborated it, or a promoting role has approved it.
-    pub fn established(&self) -> bool {
+    /// An inferred memory counts as established once enough other agents have
+    /// corroborated it (`required` of them), or a promoting role has approved it.
+    #[must_use]
+    pub fn established_with(&self, required: usize) -> bool {
         self.assertion != Assertion::Inferred
-            || self.corroborated_by.iter().any(|c| c.starts_with("approved:"))
-            || self.corroborated_by.len() >= 2
+            || self
+                .corroborated_by
+                .iter()
+                .any(|c| c.starts_with(APPROVED_PREFIX))
+            || self.corroborated_by.len() >= required
+    }
+
+    /// [`Memory::established_with`] at the default of
+    /// [`DEFAULT_REQUIRED_CORROBORATIONS`].
+    #[must_use]
+    pub fn established(&self) -> bool {
+        self.established_with(DEFAULT_REQUIRED_CORROBORATIONS)
     }
 }
 

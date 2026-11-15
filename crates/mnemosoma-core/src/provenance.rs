@@ -17,16 +17,32 @@ fn mac_for(key: &[u8], m: &Memory) -> HmacSha256 {
     };
     field(&m.id.to_le_bytes());
     field(m.tenant.as_bytes());
-    field(serde_json::to_string(&m.scope).unwrap_or_default().as_bytes());
-    field(serde_json::to_string(&m.kind).unwrap_or_default().as_bytes());
+    field(
+        serde_json::to_string(&m.scope)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    field(
+        serde_json::to_string(&m.kind)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     field(m.content.as_bytes());
     field(m.subject.as_deref().unwrap_or("").as_bytes());
     field(m.author_user.as_bytes());
     field(m.author_agent.as_bytes());
     field(m.author_role.as_bytes());
-    field(serde_json::to_string(&m.assertion).unwrap_or_default().as_bytes());
+    field(
+        serde_json::to_string(&m.assertion)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     field(m.source.as_bytes());
-    field(serde_json::to_string(&m.trust).unwrap_or_default().as_bytes());
+    field(
+        serde_json::to_string(&m.trust)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     field(&m.recorded_at.to_le_bytes());
     field(&m.valid_from.to_le_bytes());
     for d in &m.derived_from {
@@ -49,7 +65,7 @@ pub fn verify(key: &[u8], m: &Memory) -> bool {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

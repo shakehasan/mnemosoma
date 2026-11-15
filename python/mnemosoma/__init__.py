@@ -1,9 +1,10 @@
 """Mnemosoma: memory for multi-agent, multi-user systems."""
 
+from . import limits
 from ._core import __version__
 from .consolidation import ConsolidationReport, Consolidator, Fact
 from .context import render_context
-from .guards import GuardBlocked, injection_guard, pii_guard
+from .guards import GuardBlockedError, injection_guard, pii_guard
 from .store import AsyncMemoryStore, MemoryStore
 from .types import Hit, Identity, Memory, Scope
 
@@ -12,7 +13,7 @@ __all__ = [
     "ConsolidationReport",
     "Consolidator",
     "Fact",
-    "GuardBlocked",
+    "GuardBlockedError",
     "Hit",
     "Identity",
     "Memory",
@@ -20,6 +21,7 @@ __all__ = [
     "Scope",
     "__version__",
     "injection_guard",
+    "limits",
     "pii_guard",
     "render_context",
 ]
