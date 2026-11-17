@@ -448,24 +448,29 @@ fn episodes_fade_unless_recalled() {
         .unwrap();
     s.write(&a, ep("printer jammed again"), T0).unwrap();
 
-    // One episode keeps being useful; the other is never recalled.
+    // One episode keeps being the answer; the other is never recalled.
+    let mut best_only = Query::text("caterer menu");
+    best_only.k = 1;
     for month in 1..=5 {
-        s.recall(&a, &Query::text("caterer menu"), T0 + month * 30 * DAY);
+        s.recall(&a, &best_only, T0 + month * 30 * DAY);
     }
     let report = s.sweep(T0 + 6 * 30 * DAY).unwrap();
     assert_eq!(report.archived, 1);
-    assert!(s
-        .recall(&a, &Query::text("printer jammed"), T0 + 6 * 30 * DAY)
-        .is_empty());
-    assert_eq!(
-        s.recall(&a, &Query::text("caterer"), T0 + 6 * 30 * DAY)
-            .len(),
-        1
-    );
+    let later = T0 + 6 * 30 * DAY;
+    let mentions_printer = |hits: &[Hit]| hits.iter().any(|h| h.memory.content.contains("printer"));
 
+    // The faded episode is no longer returned, even when asked for by name.
+    assert!(!mentions_printer(&s.recall(
+        &a,
+        &Query::text("printer jammed"),
+        later
+    )));
+    assert_eq!(s.recall(&a, &Query::text("caterer"), later).len(), 1);
+
+    // It is archived, not erased: a deep search still finds it.
     let mut deep = Query::text("printer jammed");
     deep.include_archived = true;
-    assert_eq!(s.recall(&a, &deep, T0 + 6 * 30 * DAY).len(), 1);
+    assert!(mentions_printer(&s.recall(&a, &deep, later)));
 }
 
 #[test]

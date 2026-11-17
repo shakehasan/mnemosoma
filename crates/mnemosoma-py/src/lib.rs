@@ -3,6 +3,7 @@
 //! for every call into the engine, so agents on different threads do not
 //! queue behind each other in Python.
 
+use mnemosoma_core::text::Tokenizer;
 use mnemosoma_core::{
     index, now_ms, Error, Identity, MemoryStore, NewMemory, Query, RolePolicy, Scope, StoreConfig,
     Tuning,
@@ -222,7 +223,10 @@ fn default_tuning() -> PyResult<String> {
 /// The built-in hashing embedder, exposed for inspection and tests.
 #[pyfunction]
 fn hash_embed(text: &str) -> Vec<f32> {
-    index::hash_embed(text)
+    index::hash_embed(
+        &Tokenizer::plain().tokens(text),
+        Tuning::default().trigram_weight,
+    )
 }
 
 #[pymodule]

@@ -1,30 +1,36 @@
-//! Ranking primitives: tokenizer, a dependency-free hashing embedder,
+//! Ranking primitives: a dependency-free hashing embedder,
 //! similarity functions, top-n selection and reciprocal rank fusion.
 
 use std::collections::HashMap;
 
+/// Dimensions of the built-in embedding.
 pub const HASH_DIM: usize = 256;
-
-pub fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
-        .collect()
-}
+/// Characters per n-gram in the built-in embedding.
+const TRIGRAM: usize = 3;
+/// Prefix that keeps a trigram's hash apart from a whole word spelled the same.
+const TRIGRAM_MARK: char = '#';
+/// FNV-1a 64-bit offset basis and prime.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = FNV_OFFSET;
     for b in bytes {
         h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h = h.wrapping_mul(FNV_PRIME);
     }
     h
 }
 
-/// A feature-hashing embedding over words and character trigrams. It needs no
-/// model and no network, so the store works out of the box. Callers who want
-/// semantic recall pass their own embeddings instead.
-pub fn hash_embed(text: &str) -> Vec<f32> {
+/// A feature-hashing embedding over words and their character trigrams. It
+/// needs no model and no network, so the store works out of the box. Callers
+/// who want semantic recall pass their own embeddings instead.
+///
+/// Each word counts 1 and each of its trigrams counts `trigram_weight`, so
+/// words that are spelled alike land near each other. The result has unit
+/// length.
+#[must_use]
+pub fn hash_embed(tokens: &[String], trigram_weight: f32) -> Vec<f32> {
     let mut v = vec![0f32; HASH_DIM];
     {
         let mut add = |feature: &[u8], weight: f32| {
@@ -33,12 +39,14 @@ pub fn hash_embed(text: &str) -> Vec<f32> {
             let sign = if h >> 63 == 1 { -1.0 } else { 1.0 };
             v[i] += sign * weight;
         };
-        for tok in tokenize(text) {
+        for tok in tokens {
             add(tok.as_bytes(), 1.0);
             let chars: Vec<char> = tok.chars().collect();
-            for w in chars.windows(3) {
-                let gram: String = std::iter::once('#').chain(w.iter().copied()).collect();
-                add(gram.as_bytes(), 0.5);
+            for w in chars.windows(TRIGRAM) {
+                let gram: String = std::iter::once(TRIGRAM_MARK)
+                    .chain(w.iter().copied())
+                    .collect();
+                add(gram.as_bytes(), trigram_weight);
             }
         }
     }

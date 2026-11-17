@@ -11,6 +11,25 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tuning {
+    // ---- Text -------------------------------------------------------
+    /// Reduce words to their stems, so "booked" matches "booking". Names a
+    /// language such as `"english"`; `None` leaves words as written.
+    pub stem_language: Option<String>,
+    /// Leave common English function words ("the", "is", "of") out of the
+    /// index and out of questions.
+    pub drop_stopwords: bool,
+    /// Weight of each character trigram, relative to 1 for a whole word, in
+    /// the built-in embedding. Higher values make it more tolerant of
+    /// spelling differences and less exact.
+    pub trigram_weight: f32,
+    /// Vector matches at or below this cosine similarity are ignored. The
+    /// built-in embedding gives unrelated texts a similarity near zero that
+    /// is sometimes slightly positive by chance; this keeps those from
+    /// counting as matches. It is off (zero) by default: on LongMemEval,
+    /// weak matches still carried signal, and a floor of 0.05 or 0.1 lowered
+    /// recall at ten by 0.4 and 1.7 points.
+    pub min_vector_similarity: f32,
+
     // ---- Rank fusion -------------------------------------------------
     /// Reciprocal rank fusion constant. Larger values flatten the gap
     /// between first and later ranks. 60 is the value from the original
@@ -69,6 +88,10 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Self {
+            stem_language: Some("english".into()),
+            drop_stopwords: true,
+            trigram_weight: 0.5,
+            min_vector_similarity: 0.0,
             rrf_k: 60.0,
             pool_factor: 4,
             min_pool: 32,
@@ -101,6 +124,7 @@ impl Tuning {
     pub fn validate(&self) -> Result<(), String> {
         let positive = [
             ("rrf_k", self.rrf_k),
+            ("trigram_weight", self.trigram_weight),
             ("bm25_k1", self.bm25_k1),
             ("weight_trusted", self.weight_trusted),
             ("weight_standard", self.weight_standard),
@@ -116,6 +140,7 @@ impl Tuning {
             ("bm25_b", self.bm25_b),
             ("graph_carry", self.graph_carry),
             ("salience_weight", self.salience_weight),
+            ("min_vector_similarity", self.min_vector_similarity),
             ("ann_min_share", self.ann_min_share),
         ];
         for (name, value) in unit {
@@ -136,6 +161,9 @@ impl Tuning {
             if value == 0 {
                 return Err(format!("{name} must be at least 1"));
             }
+        }
+        if let Some(language) = &self.stem_language {
+            crate::text::stemming_algorithm(language)?;
         }
         if self.ann_max_ef < self.ann_min_ef {
             return Err("ann_max_ef must be at least ann_min_ef".into());
