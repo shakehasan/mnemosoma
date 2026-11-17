@@ -103,7 +103,7 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 
 **Why the exact fallback.** Below a few thousand rows an exact scan is faster than a graph walk and has perfect recall. When a caller can read only a sliver of a scope, a filtered graph walk degrades, so scanning the sliver is better.
 
-**Cost.** Approximate results differ slightly from exact ones; the tests require at least 90% agreement on the top ten. Building the graph for a very large scope takes time (about 70 seconds for one million vectors in a single tenant on a 12-core laptop). Erased vectors leave a zeroed node in the graph until the store is reopened.
+**Cost.** Approximate results differ slightly from exact ones; the tests require at least 90% agreement on the top ten. Building the graph for a very large scope takes time (70 to 90 seconds for one million vectors in a single tenant on a 12-core laptop). Erased vectors leave a zeroed node in the graph until the store is reopened.
 
 ## 10. Trust is recorded at write time and inherited
 

@@ -523,15 +523,15 @@ How to read this:
 
 ## Capacity
 
-Measured with [`crates/mnemosoma-core/examples/load.rs`](crates/mnemosoma-core/examples/load.rs) on a laptop: Intel Core i7-1260P (12 cores), 16 GB RAM, Windows 11, on mains power, release build, in-memory store, built-in embedder. On battery the same runs are roughly two to three times slower. Writes and recalls run on one thread; the index build uses all cores. Each tenant has 100 users, 20 agents in 4 roles and 10 teams. Every returned memory is re-checked against the scope rules.
+Measured with [`crates/mnemosoma-core/examples/load.rs`](crates/mnemosoma-core/examples/load.rs) on a laptop: Intel Core i7-1260P (12 cores), 16 GB RAM, Windows 11, on mains power, release build, in-memory store, built-in embedder. On battery the same runs are slower still. Writes and recalls run on one thread; the index build uses all cores. Each tenant has 100 users, 20 agents in 4 roles and 10 teams. Every returned memory is re-checked against the scope rules.
 
 | Memories | Tenants | Readable per caller | Writes per second | Index build | Recall p50 | Recall p95 | Permission leaks |
 |---|---|---|---|---|---|---|---|
-| 100,000 | 10 | about 750 | 77,000 | 0.6 s | 0.12 ms | 0.15 ms | 0 of 16,000 hits |
-| 1,000,000 | 100 | about 750 | 64,000 | 6.7 s | 0.14 ms | 0.16 ms | 0 of 16,000 hits |
-| 1,000,000 | 1 | about 75,000 | 80,000 | 72 s | 2.4 ms | 2.7 ms | 0 of 4,000 hits |
+| 100,000 | 10 | about 750 | 37,000 | 0.8 s | 0.15 ms | 0.22 ms | 0 of 16,000 hits |
+| 1,000,000 | 100 | about 750 | 29,000 | 8.1 s | 0.24 ms | 0.37 ms | 0 of 16,000 hits |
+| 1,000,000 | 1 | about 75,000 | 37,000 | 91 s | 3.8 ms | 5.7 ms | 0 of 4,000 hits |
 
-Write speed varied between about 40,000 and 80,000 per second from run to run on this machine. This table was measured before stemming and stopword removal became the defaults. In a same-machine comparison afterwards, they lowered write throughput by about 20% and left recall time unchanged; the table has not been re-measured on mains power since.
+These figures are from 16 November 2026, with the current defaults. Results move with the laptop's power and thermal state: an earlier session on the same machine, before stemming was on by default, ran up to twice as fast (recall p50 of 0.12 ms, 0.14 ms and 2.4 ms for the three rows). Stemming itself accounts for about 20% of the difference in write speed and none in recall.
 
 Run it yourself:
 
@@ -542,7 +542,7 @@ cargo run --release -p mnemosoma-core --example load -- 1000000 100
 What these numbers do and do not show:
 
 - Recall cost follows the number of memories the caller is allowed to read, not the size of the store. The first two rows hold the same readable set while the store grows tenfold, and recall time barely moves.
-- The third row is the hard case: one tenant, with each caller able to read about 75,000 memories. There, vector ranking goes through an HNSW graph per scope. Before the index it took 8.9 ms at p50; the index brings it to 2.4 ms.
+- The third row is the hard case: one tenant, with each caller able to read about 75,000 memories. There, vector ranking goes through an HNSW graph per scope. When the index was added, the same run went from 8.9 ms to 2.4 ms at p50 in back-to-back measurements; the table shows a later, slower session.
 - Scopes with fewer than 4,096 readable memories, or where the caller can read under 5% of the scope, are scored exactly: at that size a scan is fast and has perfect recall. The approximate index matches the exact top 10 for at least 90% of results in the tests.
 - Writes do not wait for the index. It catches up on first use, or all at once with `build_index()` after a bulk load, which is what the "Index build" column times.
 - The store is one process. Writers take turns behind one lock; multi-threaded write throughput has not been measured.
