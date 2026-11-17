@@ -64,6 +64,11 @@ pub struct StoreConfig {
     pub archive_below: f32,
     /// Corroborations from other agents that establish an inference.
     pub required_corroborations: usize,
+    /// Ask the operating system to put every write on disk before the call
+    /// returns. Off by default: a write then survives the process crashing
+    /// but can be lost if the machine loses power within moments of it.
+    /// Turning it on trades write speed for that guarantee.
+    pub sync_writes: bool,
     pub policies: HashMap<String, RolePolicy>,
     /// Ranking and indexing parameters. See [`Tuning`].
     pub tuning: Tuning,
@@ -76,6 +81,7 @@ impl StoreConfig {
             half_life_ms: DEFAULT_HALF_LIFE_MS,
             archive_below: DEFAULT_ARCHIVE_BELOW,
             required_corroborations: DEFAULT_REQUIRED_CORROBORATIONS,
+            sync_writes: false,
             policies: default_roles(),
             tuning: Tuning::default(),
         }
@@ -207,19 +213,48 @@ pub struct Stats {
     pub grants: usize,
     /// Log entries rejected on load because their signature did not verify.
     pub quarantined: usize,
+    /// Bytes dropped from the end of the log on load: a write that was cut
+    /// off by a crash before it finished.
+    pub recovered_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Event {
-    Meta { next_id: u64, next_grant_id: u64 },
-    Write { memory: Box<Memory> },
-    Supersede { old: u64, new: u64, at: i64 },
-    Grant { grant: Grant },
-    Revoke { grant_id: u64, at: i64 },
-    Forget { id: u64 },
-    Corroborate { id: u64, by: String },
-    Archive { id: u64 },
+    Meta {
+        next_id: u64,
+        next_grant_id: u64,
+    },
+    Write {
+        memory: Box<Memory>,
+    },
+    Supersede {
+        old: u64,
+        new: u64,
+        at: i64,
+    },
+    Grant {
+        grant: Grant,
+    },
+    Revoke {
+        grant_id: u64,
+        at: i64,
+    },
+    Forget {
+        id: u64,
+    },
+    Corroborate {
+        id: u64,
+        by: String,
+    },
+    Archive {
+        id: u64,
+    },
+    /// Several events that belong to one operation, written as one line so
+    /// a crash leaves either all of them or none.
+    Batch {
+        events: Vec<Event>,
+    },
 }
 
 type ChainKey = (String, Scope, String);
@@ -368,6 +403,7 @@ pub struct MemoryStore {
     next_id: u64,
     next_grant_id: u64,
     quarantined: usize,
+    recovered_bytes: u64,
     path: Option<PathBuf>,
     log: Option<File>,
 }
@@ -399,6 +435,7 @@ impl MemoryStore {
             next_id: 1,
             next_grant_id: 1,
             quarantined: 0,
+            recovered_bytes: 0,
             path: None,
             log: None,
         }
@@ -415,24 +452,60 @@ impl MemoryStore {
         cfg.validate()?;
         let path = path.as_ref().to_path_buf();
         let mut store = Self::in_memory(cfg);
+        let mut ends_with_newline = true;
         if path.exists() {
-            for line in BufReader::new(File::open(&path)?).lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
+            let mut reader = BufReader::new(File::open(&path)?);
+            let mut line = Vec::new();
+            let (mut offset, mut number) = (0u64, 0usize);
+            loop {
+                line.clear();
+                let read = reader.read_until(b'\n', &mut line)? as u64;
+                if read == 0 {
+                    break;
                 }
-                let event: Event = serde_json::from_str(&line)?;
-                if let Event::Write { memory } = &event {
-                    store.next_id = store.next_id.max(memory.id + 1);
-                    if !provenance::verify(&store.cfg.signing_key, memory) {
-                        store.quarantined += 1;
-                        continue;
+                number += 1;
+                let complete = line.last() == Some(&b'\n');
+                let parsed = std::str::from_utf8(&line)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| {
+                        if text.trim().is_empty() {
+                            Ok(None)
+                        } else {
+                            serde_json::from_str::<Event>(text)
+                                .map(Some)
+                                .map_err(|e| e.to_string())
+                        }
+                    });
+                match parsed {
+                    Ok(Some(event)) => store.replay(event),
+                    Ok(None) => {}
+                    // The last line has no newline and does not parse: a write
+                    // was cut off part-way. Everything before it is intact.
+                    Err(_) if !complete => {
+                        store.recovered_bytes = read;
+                        drop(reader);
+                        OpenOptions::new()
+                            .write(true)
+                            .open(&path)?
+                            .set_len(offset)?;
+                        break;
+                    }
+                    Err(reason) => {
+                        return Err(Error::Io(format!(
+                            "log is corrupt at line {number}: {reason}"
+                        )));
                     }
                 }
-                store.apply(event);
+                ends_with_newline = complete;
+                offset += read;
             }
         }
-        store.log = Some(OpenOptions::new().create(true).append(true).open(&path)?);
+        let mut log = OpenOptions::new().create(true).append(true).open(&path)?;
+        if !ends_with_newline {
+            // A complete record that lost only its newline: finish the line.
+            log.write_all(b"\n")?;
+        }
+        store.log = Some(log);
         store.path = Some(path);
         Ok(store)
     }
@@ -441,13 +514,55 @@ impl MemoryStore {
     // Event log
     // ------------------------------------------------------------------
 
+    /// Apply an event read from the log, setting aside any memory whose
+    /// signature does not verify.
+    fn replay(&mut self, event: Event) {
+        match event {
+            Event::Batch { events } => events.into_iter().for_each(|e| self.replay(e)),
+            Event::Write { memory } => {
+                self.next_id = self.next_id.max(memory.id + 1);
+                if provenance::verify(&self.cfg.signing_key, &memory) {
+                    self.apply(Event::Write { memory });
+                } else {
+                    self.quarantined += 1;
+                }
+            }
+            other => self.apply(other),
+        }
+    }
+
+    /// Append one event to the log, then apply it.
     fn emit(&mut self, event: Event) -> Result<(), Error> {
         if let Some(log) = self.log.as_mut() {
             let mut line = serde_json::to_string(&event)?;
             line.push('\n');
             log.write_all(line.as_bytes())?;
+            if self.cfg.sync_writes {
+                log.sync_data()?;
+            }
         }
         self.apply(event);
+        Ok(())
+    }
+
+    /// Append the events of one operation as a single line, then apply them.
+    fn emit_all(&mut self, mut events: Vec<Event>) -> Result<(), Error> {
+        match events.len() {
+            0 => Ok(()),
+            1 => self.emit(events.remove(0)),
+            _ => self.emit(Event::Batch { events }),
+        }
+    }
+
+    /// Ask the operating system to put everything written so far on disk.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the operating system reports an error.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        if let Some(log) = self.log.as_mut() {
+            log.sync_data()?;
+        }
         Ok(())
     }
 
@@ -602,6 +717,7 @@ impl MemoryStore {
                     }
                 }
             }
+            Event::Batch { events } => events.into_iter().for_each(|e| self.apply(e)),
             Event::Archive { id } => {
                 if let Some(m) = self.memories.get_mut(&id) {
                     m.archived = true;
@@ -645,6 +761,7 @@ impl MemoryStore {
                 })?;
             }
             out.flush()?;
+            out.get_ref().sync_all()?;
         }
         self.log = None; // Windows cannot replace a file that is still open.
         std::fs::rename(&tmp, &path)?;
@@ -883,23 +1000,24 @@ impl MemoryStore {
             }
         }
 
-        self.emit(Event::Write {
+        let mut events = vec![Event::Write {
             memory: Box::new(memory),
-        })?;
+        }];
         if let Some((_, prev)) = before {
-            self.emit(Event::Supersede {
+            events.push(Event::Supersede {
                 old: prev,
                 new: id,
                 at: valid_from,
-            })?;
+            });
         }
         if let Some((next_from, next)) = after {
-            self.emit(Event::Supersede {
+            events.push(Event::Supersede {
                 old: id,
                 new: next,
                 at: next_from,
-            })?;
+            });
         }
+        self.emit_all(events)?;
         Ok(id)
     }
 
@@ -1468,9 +1586,12 @@ impl MemoryStore {
                 }
             }
         }
-        for gone in &doomed {
-            self.emit(Event::Forget { id: *gone })?;
-        }
+        self.emit_all(
+            doomed
+                .iter()
+                .map(|gone| Event::Forget { id: *gone })
+                .collect(),
+        )?;
         self.compact()?;
         Ok(doomed.len())
     }
@@ -1489,12 +1610,9 @@ impl MemoryStore {
                 fading.push(m.id);
             }
         }
-        for id in &expired {
-            self.emit(Event::Forget { id: *id })?;
-        }
-        for id in &fading {
-            self.emit(Event::Archive { id: *id })?;
-        }
+        let mut events: Vec<Event> = expired.iter().map(|id| Event::Forget { id: *id }).collect();
+        events.extend(fading.iter().map(|id| Event::Archive { id: *id }));
+        self.emit_all(events)?;
         Ok(SweepReport {
             expired: expired.len(),
             archived: fading.len(),
@@ -1541,6 +1659,7 @@ impl MemoryStore {
                 .filter(|g| g.revoked_at.is_none())
                 .count(),
             quarantined: self.quarantined,
+            recovered_bytes: self.recovered_bytes,
         }
     }
 }

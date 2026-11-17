@@ -98,3 +98,27 @@ def test_stemming_and_stopwords_can_be_turned_off():
 def test_unknown_stemming_language_is_refused():
     with pytest.raises(ValueError, match="unknown stemming language"):
         MemoryStore("k", tuning={"stem_language": "klingon"})
+
+
+def test_a_torn_write_is_recovered_and_synced_writes_work(tmp_path):
+    path = tmp_path / "memory.log"
+    store = MemoryStore("k", path, sync_writes=True)
+    store.write(ANA, "the door code is 7788", scope=TEAM, now=T0)
+    store.flush()
+    del store
+
+    with path.open("ab") as log:
+        log.write(b'{"op":"write","memory":{"id":2,"content":"half a rec')
+
+    reopened = MemoryStore("k", path)
+    assert reopened.stats()["memories"] == 1
+    assert reopened.stats()["recovered_bytes"] > 0
+    reopened.write(ANA, "the alarm code is 4411", scope=TEAM, now=T0)
+    del reopened
+    assert MemoryStore("k", path).stats() == {
+        "memories": 2,
+        "tenants": 1,
+        "grants": 0,
+        "quarantined": 0,
+        "recovered_bytes": 0,
+    }

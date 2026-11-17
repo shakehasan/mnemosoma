@@ -546,7 +546,7 @@ What these numbers do and do not show:
 - Scopes with fewer than 4,096 readable memories, or where the caller can read under 5% of the scope, are scored exactly: at that size a scan is fast and has perfect recall. The approximate index matches the exact top 10 for at least 90% of results in the tests.
 - Writes do not wait for the index. It catches up on first use, or all at once with `build_index()` after a bulk load, which is what the "Index build" column times.
 - The store is one process. Writers take turns behind one lock; multi-threaded write throughput has not been measured.
-- Durability is an append-only file with no fsync per write. Server mode and Postgres are not built.
+- Durability is an append-only log. Each operation is one line, so a crash leaves it either fully written or absent, and a write cut off by a crash is dropped on the next start with the rest intact. By default the operating system decides when data reaches the disk; `sync_writes=True` forces it on every write, at a cost in write speed that has not been measured here. Server mode and Postgres are not built.
 
 ## Configuration
 
@@ -585,8 +585,8 @@ A value out of range, or a setting name that does not exist, is refused with the
 | Safety | Trust tiers, signed provenance, injection guard, PII guard, review queue | Model-based injection detection |
 | Python | Typed SDK with type stubs, async API, pluggable embedder, consolidator, prompt context, validated configuration | Streaming consolidation |
 | Integrations | LangChain retriever and tools, LangGraph `BaseStore`, LangGraph example, MCP server tested over stdio, optional LangSmith tracing | |
-| Storage | In-memory and single-file log | Postgres backend, server mode |
-| Evaluation | 37 engine tests, 48 SDK tests, behaviour eval suite, load benchmark, LongMemEval retrieval benchmark | LongMemEval end-to-end answer accuracy, LoCoMo |
+| Storage | In-memory and single-file log, crash recovery, atomic multi-step writes, optional sync on every write | Snapshots, Postgres backend, server mode |
+| Evaluation | 41 engine tests, 49 SDK tests, behaviour eval suite, load benchmark, LongMemEval retrieval benchmark | LongMemEval end-to-end answer accuracy, LoCoMo |
 | Code quality | `rustfmt`, Clippy with warnings as errors, Ruff and mypy, all enforced in CI | |
 | Packaging | CI on Linux, macOS and Windows; release pipeline for wheels on five platforms, source distribution and crate ([RELEASING.md](RELEASING.md)) | First release to PyPI and crates.io |
 

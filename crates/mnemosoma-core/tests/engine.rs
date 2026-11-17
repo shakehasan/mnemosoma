@@ -807,3 +807,130 @@ fn approximate_vector_search_agrees_with_exact_and_respects_scopes() {
         "approximate top 10 matched exact for {share:.2}"
     );
 }
+
+fn temp_log(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("mnemosoma-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.log");
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+#[test]
+fn a_write_cut_off_by_a_crash_is_dropped_and_the_rest_survives() {
+    use std::io::Write;
+    let path = temp_log("torn");
+    let ana = who("acme", "ana", "r1", "researcher");
+    let scope = Scope::UserPrivate("ana".into());
+    {
+        let mut s = MemoryStore::open(&path, StoreConfig::new("k")).unwrap();
+        s.write(&ana, fact(scope.clone(), "the door code is 7788"), T0)
+            .unwrap();
+        s.write(&ana, fact(scope.clone(), "the alarm code is 4411"), T0)
+            .unwrap();
+    }
+    let intact = std::fs::metadata(&path).unwrap().len();
+    // The process dies part-way through the next write.
+    let torn = br#"{"op":"write","memory":{"id":3,"tenant":"acme","content":"the safe co"#;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(torn)
+        .unwrap();
+
+    let mut s = MemoryStore::open(&path, StoreConfig::new("k")).unwrap();
+    assert_eq!(s.stats().memories, 2);
+    assert_eq!(s.stats().recovered_bytes, torn.len() as u64);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), intact);
+
+    // The store keeps working, and the next open is clean.
+    s.write(&ana, fact(scope, "the safe code is 9001"), T0)
+        .unwrap();
+    drop(s);
+    let s = MemoryStore::open(&path, StoreConfig::new("k")).unwrap();
+    assert_eq!((s.stats().memories, s.stats().recovered_bytes), (3, 0));
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}
+
+#[test]
+fn damage_in_the_middle_of_the_log_is_an_error_not_silent_loss() {
+    let path = temp_log("corrupt");
+    let ana = who("acme", "ana", "r1", "researcher");
+    {
+        let mut s = MemoryStore::open(&path, StoreConfig::new("k")).unwrap();
+        for text in ["first note", "second note", "third note"] {
+            s.write(&ana, fact(Scope::UserPrivate("ana".into()), text), T0)
+                .unwrap();
+        }
+    }
+    let damaged = std::fs::read_to_string(&path)
+        .unwrap()
+        .replacen("{\"op\"", "{\"op", 2);
+    let damaged = damaged.replacen("{\"op", "{\"op\"", 1); // leave the first line intact
+    std::fs::write(&path, damaged).unwrap();
+    let Err(Error::Io(message)) = MemoryStore::open(&path, StoreConfig::new("k")) else {
+        panic!("a damaged line in the middle must not be skipped");
+    };
+    assert!(message.contains("line 2"), "{message}");
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}
+
+#[test]
+fn a_record_missing_only_its_newline_is_kept() {
+    let path = temp_log("newline");
+    let ana = who("acme", "ana", "r1", "researcher");
+    let scope = Scope::UserPrivate("ana".into());
+    {
+        let mut s = MemoryStore::open(&path, StoreConfig::new("k")).unwrap();
+        s.write(&ana, fact(scope.clone(), "first note"), T0)
+            .unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.trim_end()).unwrap();
+    {
+        let mut s = MemoryStore::open(&path, StoreConfig::new("k")).unwrap();
+        assert_eq!((s.stats().memories, s.stats().recovered_bytes), (1, 0));
+        s.write(&ana, fact(scope, "second note"), T0).unwrap();
+    }
+    assert_eq!(
+        MemoryStore::open(&path, StoreConfig::new("k"))
+            .unwrap()
+            .stats()
+            .memories,
+        2
+    );
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}
+
+#[test]
+fn a_fact_and_what_it_supersedes_are_written_as_one_line() {
+    let path = temp_log("batch");
+    let ana = who("acme", "ana", "r1", "researcher");
+    let scope = Scope::UserPrivate("ana".into());
+    let mut cfg = StoreConfig::new("k");
+    cfg.sync_writes = true;
+    let mut s = MemoryStore::open(&path, cfg).unwrap();
+    let version = |text: &str| {
+        let mut m = fact(scope.clone(), text);
+        m.subject = Some("ana/city".into());
+        m
+    };
+    s.write(&ana, version("ana lives in Lisbon"), T0).unwrap();
+    s.write(&ana, version("ana lives in Tokyo"), T0 + DAY)
+        .unwrap();
+    s.sync().unwrap();
+    drop(s);
+
+    let log = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[1].contains("\"batch\"") && lines[1].contains("\"supersede\""));
+
+    let mut s = MemoryStore::open(&path, StoreConfig::new("k")).unwrap();
+    assert_eq!(
+        contents(&s.recall(&ana, &Query::text("where does ana live"), T0 + 2 * DAY)),
+        ["ana lives in Tokyo"]
+    );
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}

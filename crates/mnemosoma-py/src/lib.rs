@@ -61,7 +61,7 @@ impl Store {
 #[pymethods]
 impl Store {
     #[new]
-    #[pyo3(signature = (signing_key, path=None, half_life_days=None, archive_below=None, policies=None, tuning=None, required_corroborations=None))]
+    #[pyo3(signature = (signing_key, path=None, half_life_days=None, archive_below=None, policies=None, tuning=None, required_corroborations=None, sync_writes=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         signing_key: Vec<u8>,
@@ -71,6 +71,7 @@ impl Store {
         policies: Option<&str>,
         tuning: Option<&str>,
         required_corroborations: Option<usize>,
+        sync_writes: Option<bool>,
     ) -> PyResult<Self> {
         let mut cfg = StoreConfig::new(signing_key);
         if let Some(days) = half_life_days {
@@ -87,6 +88,9 @@ impl Store {
         }
         if let Some(required) = required_corroborations {
             cfg.required_corroborations = required;
+        }
+        if let Some(sync) = sync_writes {
+            cfg.sync_writes = sync;
         }
         cfg.validate().map_err(to_py)?;
         let store = match path {
@@ -202,6 +206,10 @@ impl Store {
     fn sweep(&self, py: Python<'_>, now: Option<i64>) -> PyResult<String> {
         let report = self.run(py, move |s| s.sweep(now.unwrap_or_else(now_ms)))?;
         dump(&report)
+    }
+
+    fn sync(&self, py: Python<'_>) -> PyResult<()> {
+        self.run(py, MemoryStore::sync)
     }
 
     fn build_index(&self, py: Python<'_>) -> PyResult<usize> {

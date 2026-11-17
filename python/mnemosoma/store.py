@@ -49,6 +49,10 @@ class MemoryStore:
             this. Defaults to the engine's 0.05.
         required_corroborations: How many other agents must corroborate an
             inference before it counts as established. Defaults to 2.
+        sync_writes: Ask the operating system to put every write on disk
+            before the call returns. Off by default: a write survives the
+            process crashing either way, and this adds protection against
+            power loss at the cost of write speed.
         tuning: Overrides for the engine's ranking and indexing parameters,
             for example ``{"rrf_k": 30, "graph_carry": 0.5}``. Anything left
             out keeps its default; :meth:`default_tuning` lists them all.
@@ -71,6 +75,7 @@ class MemoryStore:
         half_life_days: float | None = None,
         archive_below: float | None = None,
         required_corroborations: int | None = None,
+        sync_writes: bool | None = None,
         tuning: dict[str, Any] | None = None,
         policies: dict[str, dict[str, Any]] | None = None,
         embedder: Embedder | None = None,
@@ -86,6 +91,7 @@ class MemoryStore:
             None if policies is None else json.dumps(policies),
             None if tuning is None else json.dumps(tuning),
             required_corroborations,
+            sync_writes,
         )
         self._chars_per_token: int = {**self.default_tuning(), **(tuning or {})}["chars_per_token"]
         self._embedder = embedder
@@ -296,6 +302,10 @@ class MemoryStore:
         """Drop expired memories and archive faded episodes. Returns ``{"expired", "archived"}``."""
         return json.loads(self._core.sweep(to_ms(now)))
 
+    def flush(self) -> None:
+        """Ask the operating system to put everything written so far on disk."""
+        self._core.sync()
+
     def build_index(self) -> int:
         """Index every memory not yet in the approximate vector indexes, in parallel.
 
@@ -343,3 +353,4 @@ class AsyncMemoryStore:
     forget = _in_thread("forget")
     sweep = _in_thread("sweep")
     build_index = _in_thread("build_index")
+    flush = _in_thread("flush")
