@@ -17,7 +17,8 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 11. [A Rust engine behind a Python API](#11-a-rust-engine-behind-a-python-api)
 12. [A built-in embedder that needs no model](#12-a-built-in-embedder-that-needs-no-model)
 13. [Every parameter is a named setting](#13-every-parameter-is-a-named-setting)
-14. [Known limits](#known-limits)
+14. [Names are found by rule, not by a model](#14-names-are-found-by-rule-not-by-a-model)
+15. [Known limits](#known-limits)
 
 ## 1. Permissions are checked before ranking
 
@@ -93,7 +94,7 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 
 **Why not.** That puts a model back on the write path and makes recall quality depend on extraction quality. Entity co-mention is cruder and cheap, and it handles the common multi-hop case: the answer shares no words with the question but mentions the same person or thing as a memory that does.
 
-**Cost.** Entities must be supplied by the caller or the consolidation pass; the engine does not find them. Co-mention carries no relation type, so it cannot tell "works for" from "met once".
+**Cost.** Entities must be supplied by the caller or the consolidation pass, or found by the rule in decision 14. Co-mention carries no relation type, so it cannot tell "works for" from "met once".
 
 ## 9. Approximate search per scope, exact when small
 
@@ -139,6 +140,22 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 
 **Cost.** More surface to document and keep stable.
 
+## 14. Names are found by rule, not by a model
+
+**Decision.** With `extract_entities` on, the write path finds the names in a memory from capitalisation alone: a run of capitalised words is a name. A single capitalised word that starts a sentence counts only if the scope already holds it as a name, or the text capitalises it mid-sentence too. Names in a question are found by the same rules. The setting is off by default.
+
+**Alternative.** A named-entity model, or a language-model call, on every write.
+
+**Why not.** Decision 6 again: a model on the write path makes a write slow, costly and different from one run to the next. The rule is one pass over the text and always gives the same answer. The names it finds are stored in the record, so replaying the log never derives them again.
+
+**Why names are learned per scope.** Whether "Dana" at the start of a sentence is a name depends on what has been written before. Only the scope being written to is consulted. Consulting everything the writer can read would let the contents of one scope shape what is stored in another, where different readers would see it.
+
+**What the measurements say.** On LongMemEval, found names give the name ranker something to match, and first-result recall rises from 78.9% to 82.8%. Graph expansion over the same names lowers it to 58.7%: found names are denser and noisier than listed ones, and each good match pulls in its neighbours. On generated multi-hop questions over plain sentences, that same expansion takes recall@5 from 0% to 69.3%. Which effect matters depends on the questions asked, so the choice is left to the deployment and the default is unchanged.
+
+**Two fixes that came with it.** The name ranker used to test whether a name appeared anywhere in the question, so the name "AI" matched the word "explain", and it visited every readable memory that listed a name. It now looks up the phrases of the question, whole words only, in an index, so its cost follows the length of the question. Memories that tie share the credit of the ranks they span, because the order among them carries no information.
+
+**Cost.** Capitalisation is not understanding. A heading in title case yields false names, a name typed in lower case is missed, and a language that capitalises every noun, or none, needs the setting off. A name that only ever stands alone at the start of a sentence is never learned. Graph expansion cannot tell a listed name from a found one.
+
 ## Known limits
 
 - **One process.** There is no server mode, replication or sharding. Writers share one lock.
@@ -146,4 +163,4 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 - **Durability.** By default the operating system decides when a write reaches the disk, so a power cut can lose the last moments of writes. `sync_writes` closes that gap at a cost in write speed.
 - **Retrieval only.** End-to-end answer accuracy with a reader model has not been measured.
 - **English-centric defaults.** Stemming and stopword removal default to English. Stemming supports seventeen other languages by setting; the stopword list is English only and should be turned off for other languages.
-- **Entities are not extracted.** Graph expansion needs them supplied.
+- **Names are found by capitalisation only, and only when asked.** Graph expansion treats a found name like a listed one, which costs first-result precision on single-fact questions (decision 14).

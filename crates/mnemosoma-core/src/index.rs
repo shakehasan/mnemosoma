@@ -106,6 +106,28 @@ pub fn top_ids(mut scored: Vec<(u64, f32)>, n: usize) -> Vec<u64> {
     scored.into_iter().map(|entry| entry.0).collect()
 }
 
+/// Add one ranker's reciprocal-rank credit to `fused`, for a ranker whose
+/// scores often tie. `ranking` is best first. Entries with the same score
+/// share the mean of the ranks they occupy, so the order among them, which
+/// carries no information, does not decide who gets more credit.
+pub fn rrf_tied(fused: &mut HashMap<u64, f32>, ranking: &[(u64, f32)], k: f32) {
+    let mut start = 0;
+    while start < ranking.len() {
+        let score = ranking[start].1;
+        let end = start
+            + ranking[start..]
+                .iter()
+                .take_while(|entry| entry.1 == score)
+                .count();
+        // Ranks are counted from 1; the group holds ranks start+1 to end.
+        let mean_rank = (start + 1 + end) as f32 / 2.0;
+        for (id, _) in &ranking[start..end] {
+            *fused.entry(*id).or_insert(0.0) += 1.0 / (k + mean_rank);
+        }
+        start = end;
+    }
+}
+
 pub fn sort_desc(v: &mut [(u64, f32)]) {
     v.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
 }
@@ -121,4 +143,30 @@ pub fn rrf(rankings: &[Vec<u64>], k: f32) -> HashMap<u64, f32> {
         }
     }
     fused
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tied_entries_share_the_mean_of_their_ranks() {
+        let mut fused = HashMap::new();
+        rrf_tied(&mut fused, &[(1, 3.0), (2, 1.0), (3, 1.0), (4, 0.5)], 60.0);
+        assert!((fused[&1] - 1.0 / 61.0).abs() < 1e-7);
+        // Ranks 2 and 3 are tied: both get the credit of rank 2.5.
+        assert!((fused[&2] - 1.0 / 62.5).abs() < 1e-7);
+        assert_eq!(fused[&2], fused[&3]);
+        assert!((fused[&4] - 1.0 / 64.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn without_ties_it_matches_plain_rank_fusion() {
+        let mut tied = HashMap::new();
+        rrf_tied(&mut tied, &[(7, 0.9), (8, 0.5), (9, 0.1)], 60.0);
+        let plain = rrf(&[vec![7, 8, 9]], 60.0);
+        for id in [7, 8, 9] {
+            assert!((tied[&id] - plain[&id]).abs() < 1e-7);
+        }
+    }
 }

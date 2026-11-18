@@ -447,8 +447,68 @@ def multi_hop(rng: random.Random) -> dict[str, float]:
 
 
 # --------------------------------------------------------------------------
+# 8. Multi-hop on plain text: nobody lists the names
+# --------------------------------------------------------------------------
 
-SUITES = [knowledge_and_time, isolation, sharing, poisoning, retrieval, multi_hop]
+LEAD_SENTENCES = (
+    "{project} is led by {lead}",
+    "The lead of {project} is {lead}",
+    "We agreed that {lead} runs {project}",
+)
+SEAT_SENTENCES = (
+    "{lead} sits on floor {floor} by the east stairwell",
+    "Floor {floor} by the east stairwell is where {lead} sits",
+    "You can find {lead} on floor {floor} by the east stairwell",
+)
+
+
+def multi_hop_plain_text(rng: random.Random) -> dict[str, float]:
+    """The same question as above, but the memories are plain sentences.
+
+    The sentences vary in where the name stands, and the two facts of a case
+    are written in either order, because a name that only ever starts a
+    sentence is the hard case for finding names by capitalisation.
+    """
+    me = agent("ana")
+    team = Scope.team(me.team)
+    cases: list[tuple[str, list[tuple[str, bool]]]] = []
+    for case in range(150):
+        project = f"Project K{case:03d}"
+        lead = f"{rng.choice(PEOPLE)} {chr(65 + case % 26)}{case}"
+        facts = [
+            (rng.choice(LEAD_SENTENCES).format(project=project, lead=lead), False),
+            (rng.choice(SEAT_SENTENCES).format(lead=lead, floor=rng.randint(2, 30)), True),
+        ]
+        rng.shuffle(facts)
+        cases.append((project, facts))
+    notes = ["Notes on " + " ".join(rng.sample(WORDS, 4)) for _ in range(600)]
+
+    def found(extract: bool) -> float:
+        store = MemoryStore("eval", tuning={"extract_entities": extract})
+        answers = []
+        for project, facts in cases:
+            for sentence, is_answer in facts:
+                written = store.write(me, sentence, scope=team, now=T0)
+                if is_answer:
+                    answers.append((project, written))
+        for note in notes:
+            store.write(me, note, scope=team, now=T0)
+        hit = 0
+        for project, answer in answers:
+            ids = [h.memory.id for h in store.recall(me, f"where is the lead of {project}", k=5, now=T0)]
+            hit += answer in ids
+        return hit / len(answers)
+
+    return {
+        "plain_multi_hop_recall_at_5_names_not_found": found(False),
+        "plain_multi_hop_recall_at_5_names_found": found(True),
+        "plain_multi_hop_cases": len(cases),
+    }
+
+
+# --------------------------------------------------------------------------
+
+SUITES = [knowledge_and_time, isolation, sharing, poisoning, retrieval, multi_hop, multi_hop_plain_text]
 
 # (metric, label, bar, direction). The bar is what --check enforces.
 REPORT = [
@@ -465,6 +525,13 @@ REPORT = [
     ("retrieval_partial_recall_at_5", "Retrieval, three of five words: recall@5", 0.6, ">="),
     ("multi_hop_recall_at_5_graph_off", "Multi-hop, graph expansion off: recall@5", None, None),
     ("multi_hop_recall_at_5_graph_on", "Multi-hop, graph expansion on: recall@5", 0.9, ">="),
+    ("plain_multi_hop_recall_at_5_names_not_found", "Multi-hop on plain text, names not listed: recall@5", None, None),
+    (
+        "plain_multi_hop_recall_at_5_names_found",
+        "Multi-hop on plain text, names found on write: recall@5",
+        0.5,
+        ">=",
+    ),
 ]
 
 

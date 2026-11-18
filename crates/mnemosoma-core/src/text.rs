@@ -116,7 +116,7 @@ impl Tokenizer {
 }
 
 /// The stopword list is kept sorted so this is a binary search.
-fn is_stopword(word: &str) -> bool {
+pub(crate) fn is_stopword(word: &str) -> bool {
     ENGLISH_STOPWORDS.binary_search(&word).is_ok()
 }
 

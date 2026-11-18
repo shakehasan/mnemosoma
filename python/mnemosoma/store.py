@@ -140,7 +140,8 @@ class MemoryStore:
         write with the same subject in the same scope supersedes it. The old
         version stays readable through :meth:`history` and ``as_of`` recall.
         Name the people and things it mentions in ``entities`` and recall can
-        follow them to related memories.
+        follow them to related memories. With the ``extract_entities``
+        setting on, names found in the text are added to the ones listed.
 
         Raises:
             PermissionError: The caller's role may not write to ``scope``, or
