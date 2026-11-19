@@ -53,7 +53,9 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 
 **Why.** It keeps the durable format small and stable while the indexes change freely: the move to columnar segments, the keyword index and the approximate index needed no migration. It also makes tampering detectable, since each record carries an HMAC over its immutable fields and an edited entry is quarantined on load.
 
-**Cost.** Opening a large store means replaying the log and rebuilding indexes, so start-up time grows with size. Erasure has to rewrite the log, because an append-only file cannot forget by appending. There is no snapshot format yet.
+**Cost.** Opening a large store means replaying the log and rebuilding indexes, so start-up time grows with size. Erasure has to rewrite the log, because an append-only file cannot forget by appending.
+
+**Crash safety.** Each operation is written as one line, including a fact together with the older fact it supersedes, so a crash cannot leave half of an operation behind. If the process dies mid-write, the unfinished last line is dropped on the next open and reported in the store's statistics. A damaged line anywhere else is an error and is never skipped silently, because skipping it would lose data without anyone knowing. There is no snapshot format yet.
 
 ## 5. Facts are superseded, not overwritten
 
@@ -101,7 +103,7 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 
 **Why the exact fallback.** Below a few thousand rows an exact scan is faster than a graph walk and has perfect recall. When a caller can read only a sliver of a scope, a filtered graph walk degrades, so scanning the sliver is better.
 
-**Cost.** Approximate results differ slightly from exact ones; the tests require at least 90% agreement on the top ten. Building the graph for a very large scope takes time (about 70 seconds for one million vectors in a single tenant on a 12-core laptop). Erased vectors leave a zeroed node in the graph until the store is reopened.
+**Cost.** Approximate results differ slightly from exact ones; the tests require at least 90% agreement on the top ten. Building the graph for a very large scope takes time (70 to 90 seconds for one million vectors in a single tenant on a 12-core laptop). Erased vectors leave a zeroed node in the graph until the store is reopened.
 
 ## 10. Trust is recorded at write time and inherited
 
@@ -141,7 +143,7 @@ This document records the choices that shape Mnemosoma, what each one costs, and
 
 - **One process.** There is no server mode, replication or sharding. Writers share one lock.
 - **Start-up replays the log.** No snapshots.
-- **Durability.** Appends are not fsynced individually.
+- **Durability.** By default the operating system decides when a write reaches the disk, so a power cut can lose the last moments of writes. `sync_writes` closes that gap at a cost in write speed.
 - **Retrieval only.** End-to-end answer accuracy with a reader model has not been measured.
 - **English-centric defaults.** Stemming and stopword removal default to English. Stemming supports seventeen other languages by setting; the stopword list is English only and should be turned off for other languages.
 - **Entities are not extracted.** Graph expansion needs them supplied.

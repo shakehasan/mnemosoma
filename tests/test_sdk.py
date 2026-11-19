@@ -82,7 +82,13 @@ def test_persists_across_reopen(tmp_path):
     del first
     second = MemoryStore("k", path)
     assert texts(second.recall(ANA, "door code", now=T0)) == ["the door code is 7788"]
-    assert MemoryStore("wrong-key", path).stats() == {"memories": 0, "tenants": 0, "grants": 0, "quarantined": 1}
+    assert MemoryStore("wrong-key", path).stats() == {
+        "memories": 0,
+        "tenants": 0,
+        "grants": 0,
+        "quarantined": 1,
+        "recovered_bytes": 0,
+    }
 
 
 def test_custom_embedder_is_used_for_both_sides():

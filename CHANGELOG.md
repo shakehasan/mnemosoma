@@ -16,6 +16,7 @@ First public version, not yet tagged.
 - Explainable hits: each result reports its rank in every ranker and who shared it.
 - Columnar segments per scope, and a filtered HNSW vector index with parallel build and an exact fallback.
 - Salience decay, time-to-live, archival and cascading erasure.
+- Crash recovery for the log, atomic multi-step writes and an optional sync on every write.
 - One documented, validated `Tuning` structure for every ranking and indexing parameter.
 - Stemming (eighteen languages) and English stopword removal, on by default and configurable.
 
