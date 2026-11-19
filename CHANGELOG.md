@@ -2,9 +2,9 @@
 
 Notable changes to Mnemosoma. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.0] - 2026-11-19
 
-First public version, not yet tagged.
+First public version.
 
 ### Engine
 
@@ -42,4 +42,4 @@ First public version, not yet tagged.
 - Load benchmark with a permission-leak check.
 - LongMemEval retrieval benchmark with a published protocol.
 - CI on Linux, macOS and Windows with formatting, lint and type checks.
-- Release pipeline building wheels for five platforms.
+- Release pipeline building wheels for five platforms and attaching them to the GitHub release.
