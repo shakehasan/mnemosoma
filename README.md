@@ -437,7 +437,7 @@ store = MemoryStore("change-me", embedder=OllamaEmbeddings(model="nomic-embed-te
 Mnemosoma ships a [Model Context Protocol](https://modelcontextprotocol.io) server, so any MCP client can use it: a desktop assistant, an IDE agent or another framework. It exposes four tools: `remember`, `recall`, `history` and `forget`.
 
 ```bash
-pip install "mnemosoma[mcp]"
+pip install "mnemosoma[mcp]" --find-links https://github.com/shakehasan/mnemosoma/releases/expanded_assets/v0.1.0
 ```
 
 ```json
@@ -619,13 +619,21 @@ A value out of range, or a setting name that does not exist, is refused with the
 | Storage | In-memory and single-file log, crash recovery, atomic multi-step writes, optional sync on every write | Snapshots, Postgres backend, server mode |
 | Evaluation | 60 engine tests, 50 SDK tests, behaviour eval suite, load benchmark, LongMemEval retrieval benchmark | LongMemEval end-to-end answer accuracy, LoCoMo |
 | Code quality | `rustfmt`, Clippy with warnings as errors, Ruff and mypy, all enforced in CI | |
-| Packaging | CI on Linux, macOS and Windows; release pipeline for wheels on five platforms, source distribution and crate ([RELEASING.md](RELEASING.md)) | First release to PyPI and crates.io |
+| Packaging | CI on Linux, macOS and Windows; wheels for five platforms and a source distribution on each GitHub release ([RELEASING.md](RELEASING.md)) | Publishing to PyPI and crates.io |
 
 End-to-end answer accuracy has not been measured: the LongMemEval numbers above are for retrieval. LangSmith tracing has been tested only with tracing switched off.
 
 ## Install and develop
 
-Not on PyPI yet; the release pipeline is ready and waits on the first tagged version. Until then, build from source with Rust and Python 3.10 or newer:
+Wheels for Linux, macOS and Windows are attached to each [GitHub release](https://github.com/shakehasan/mnemosoma/releases). They need Python 3.10 or newer and no Rust toolchain:
+
+```bash
+pip install mnemosoma --find-links https://github.com/shakehasan/mnemosoma/releases/expanded_assets/v0.1.0
+```
+
+Mnemosoma is not on PyPI yet, which is why the command names the release page. Add the extras you use, for example `"mnemosoma[langchain,mcp]"`.
+
+To work on the engine itself, build from source with Rust and Python 3.10 or newer:
 
 ```bash
 pip install maturin pytest "langchain-core>=1.0" "langgraph>=1.0" "mcp>=1.2"
