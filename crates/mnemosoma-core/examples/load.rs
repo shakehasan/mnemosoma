@@ -4,7 +4,7 @@
 //!     cargo run --release -p mnemosoma-core --example load -- 100000
 //!
 //! Arguments: total memories (default 100000), tenants (default 10),
-//! recalls (default 2000).
+//! recalls (default 2000), then `names` to find names on write.
 
 use mnemosoma_core::*;
 use std::time::Instant;
@@ -73,6 +73,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let total: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(100_000);
     let tenants: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(10);
+    let queries: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(2_000);
+    let find_names = args.next().is_some_and(|a| a == "names");
     let users_per_tenant = 100;
     let agents_per_tenant = 20;
     let teams_per_tenant = 10;
@@ -91,7 +93,9 @@ fn main() {
     };
 
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    let mut store = MemoryStore::in_memory(StoreConfig::new("bench-key"));
+    let mut config = StoreConfig::new("bench-key");
+    config.tuning.extract_entities = find_names;
+    let mut store = MemoryStore::in_memory(config);
 
     // Writes: a mix of scopes the role is allowed to write.
     let mut write_ms = Vec::with_capacity(total);
@@ -120,7 +124,6 @@ fn main() {
     let index_secs = index_started.elapsed().as_secs_f64();
 
     // Recalls: every hit is checked against the scope rules independently.
-    let queries: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(2_000);
     let mut recall_ms = Vec::with_capacity(queries);
     let mut returned = 0usize;
     let mut leaks = 0usize;

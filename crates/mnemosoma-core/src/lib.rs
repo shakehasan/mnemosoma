@@ -7,6 +7,7 @@
 
 pub mod ann;
 pub mod config;
+pub mod entities;
 pub mod identity;
 pub mod index;
 pub mod memory;

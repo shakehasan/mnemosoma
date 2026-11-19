@@ -19,6 +19,8 @@ First public version, not yet tagged.
 - Crash recovery for the log, atomic multi-step writes and an optional sync on every write.
 - One documented, validated `Tuning` structure for every ranking and indexing parameter.
 - Stemming (eighteen languages) and English stopword removal, on by default and configurable.
+- Optional name finding on write (`extract_entities`): by capitalisation, with no model, learned per scope.
+- The name ranker matches whole words through an index, weighs rare names more, and splits credit between ties.
 
 ### Python
 

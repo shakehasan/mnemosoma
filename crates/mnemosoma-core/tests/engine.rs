@@ -934,3 +934,167 @@ fn a_fact_and_what_it_supersedes_are_written_as_one_line() {
     );
     std::fs::remove_dir_all(path.parent().unwrap()).ok();
 }
+
+fn extracting_store() -> MemoryStore {
+    let mut cfg = StoreConfig::new("test-key");
+    cfg.tuning.extract_entities = true;
+    MemoryStore::in_memory(cfg)
+}
+
+#[test]
+fn names_found_on_write_link_memories_nobody_tagged() {
+    let mut s = extracting_store();
+    let a = who("acme", "ana", "r1", "researcher");
+    let scope = Scope::Team("task-1".into());
+    let signed = s
+        .write(
+            &a,
+            fact(scope.clone(), "The venue contract was signed by Dana"),
+            T0,
+        )
+        .unwrap();
+    // Shares no words with the question; linked to the first only by the name.
+    let phone = s
+        .write(
+            &a,
+            fact(scope.clone(), "Dana can be reached on extension 4417"),
+            T0,
+        )
+        .unwrap();
+    for text in [
+        "The venue has free parking",
+        "The contract template is in the shared drive",
+        "Nobody has signed the catering order",
+        "The venue floor plan is attached",
+        "The contract renewal is due in May",
+        "The venue opens at nine",
+    ] {
+        let id = s.write(&a, fact(scope.clone(), text), T0).unwrap();
+        // A capital that starts a sentence, and a month, are not names.
+        assert!(s.get(&a, id, T0).unwrap().entities.is_empty(), "{text}");
+    }
+
+    assert_eq!(s.get(&a, signed, T0).unwrap().entities, ["Dana"]);
+    // Known from the memory above, so recognised at the start of a sentence.
+    assert_eq!(s.get(&a, phone, T0).unwrap().entities, ["Dana"]);
+
+    let mut q = Query::text("who signed the venue contract");
+    q.k = 20;
+    let hits = s.recall(&a, &q, T0 + 2);
+    assert_eq!(hits[0].memory.id, signed);
+    let linked = hits
+        .iter()
+        .find(|h| h.memory.id == phone)
+        .expect("reached through the name");
+    assert_eq!(
+        (linked.why.graph_rank, linked.why.keyword_rank),
+        (Some(1), None)
+    );
+
+    // Off by default: the same text is stored with no names.
+    let mut plain = store();
+    let id = plain
+        .write(&a, fact(scope, "The venue contract was signed by Dana"), T0)
+        .unwrap();
+    assert!(plain.get(&a, id, T0).unwrap().entities.is_empty());
+}
+
+#[test]
+fn listed_names_come_first_and_found_names_do_not_repeat_them() {
+    let mut s = extracting_store();
+    let a = who("acme", "ana", "r1", "researcher");
+    let mut m = fact(
+        Scope::Team("task-1".into()),
+        "We moved Apollo from Dana Reyes to the Lisbon office",
+    );
+    m.entities = vec!["apollo".into(), "Northwind Events".into()];
+    let id = s.write(&a, m, T0).unwrap();
+    assert_eq!(
+        s.get(&a, id, T0).unwrap().entities,
+        ["apollo", "Northwind Events", "Dana Reyes", "Lisbon"]
+    );
+}
+
+#[test]
+fn the_most_names_kept_per_memory_is_a_setting() {
+    let mut cfg = StoreConfig::new("test-key");
+    cfg.tuning.extract_entities = true;
+    cfg.tuning.max_extracted_entities = 1;
+    let mut s = MemoryStore::in_memory(cfg);
+    let a = who("acme", "ana", "r1", "researcher");
+    let id = s
+        .write(
+            &a,
+            fact(
+                Scope::Team("task-1".into()),
+                "We asked Priya, then Dana, then Priya again",
+            ),
+            T0,
+        )
+        .unwrap();
+    assert_eq!(s.get(&a, id, T0).unwrap().entities, ["Priya"]);
+
+    let mut cfg = StoreConfig::new("test-key");
+    cfg.tuning.max_extracted_entities = 0;
+    assert!(cfg
+        .tuning
+        .validate()
+        .unwrap_err()
+        .contains("max_extracted_entities"));
+}
+
+#[test]
+fn names_are_not_learned_from_another_scope() {
+    let mut s = extracting_store();
+    let ana = who("acme", "ana", "r1", "researcher");
+    s.write(
+        &ana,
+        fact(Scope::UserPrivate("ana".into()), "I had lunch with Zed"),
+        T0,
+    )
+    .unwrap();
+    // The team scope has never seen the name, so the word that starts the
+    // sentence is not taken on trust from what the private scope holds.
+    let id = s
+        .write(
+            &ana,
+            fact(Scope::Team("task-1".into()), "Zed joins next week"),
+            T0,
+        )
+        .unwrap();
+    assert!(s.get(&ana, id, T0).unwrap().entities.is_empty());
+
+    // Once the team scope has the name mid-sentence, it is known there.
+    s.write(
+        &ana,
+        fact(Scope::Team("task-1".into()), "We paired with Zed today"),
+        T0,
+    )
+    .unwrap();
+    let id = s
+        .write(
+            &ana,
+            fact(Scope::Team("task-1".into()), "Zed joins next week"),
+            T0,
+        )
+        .unwrap();
+    assert_eq!(s.get(&ana, id, T0).unwrap().entities, ["Zed"]);
+}
+
+#[test]
+fn a_name_in_a_question_matches_whole_words_only() {
+    let mut s = store();
+    let a = who("acme", "ana", "r1", "researcher");
+    let mut m = fact(Scope::Team("task-1".into()), "Budget notes for the lab");
+    m.entities = vec!["AI".into(), "New-York".into()];
+    s.write(&a, m, T0).unwrap();
+
+    // "ai" inside "explain" is not the name AI.
+    let hits = s.recall(&a, &Query::text("please explain the lab budget"), T0);
+    assert_eq!(hits[0].why.entity_rank, None);
+    let hits = s.recall(&a, &Query::text("what did the AI lab budget say"), T0);
+    assert_eq!(hits[0].why.entity_rank, Some(1));
+    // Case and punctuation inside a name do not matter.
+    let hits = s.recall(&a, &Query::text("budget for new york"), T0);
+    assert_eq!(hits[0].why.entity_rank, Some(1));
+}

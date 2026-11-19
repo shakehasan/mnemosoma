@@ -345,6 +345,23 @@ No keyword matched it. With only two memories stored it still gets a weak vector
 
 Every hit carries `why`: its rank in each ranker, whether the graph reached it, and whose grant made it visible. In the [evaluation](#evaluation), graph expansion takes this kind of question from 0% to 100% recall@5.
 
+### Finding names without listing them
+
+Listing names is optional. Set `extract_entities` and the engine finds them itself when a memory is written, from capitalisation alone: a run of capitalised words such as "Dana Okoro" or "Project K012" is a name. No model is called, so a write stays as predictable as before.
+
+```python
+store = MemoryStore("change-me", tuning={"extract_entities": True})
+first = store.write(me, "Project K012 is led by Dana Okoro", scope=team)
+second = store.write(me, "Dana Okoro sits on floor 7 by the east stairwell", scope=team)
+
+store.get(me, first).entities    # ("Project K012", "Dana Okoro")
+store.get(me, second).entities   # ("Dana Okoro",)
+```
+
+The rules are cautious on purpose. A single capitalised word that starts a sentence counts only if the same scope already holds it as a name, or the text capitalises it mid-sentence as well. Function words, and day and month names on their own, never count. Names you list are kept and come first. Names in a question are found by the same rules and matched as whole words.
+
+It is off by default, and the measurements say why. On LongMemEval it raises first-result recall from 78.9% to 82.8% with graph expansion off, and lowers it when graph expansion follows the found names. The [benchmark section](#longmemeval-benchmark) has the numbers and which setting suits which kind of question. Its cost in write speed has not been measured.
+
 ## Guardrails and review
 
 Guards run on every write, before the engine sees the memory.
@@ -462,6 +479,8 @@ One server process is one identity, set by whoever configures it. The client's m
 | Retrieval, three of five words: recall@5 | 100% | 300 |
 | Multi-hop, graph expansion off: recall@5 | 0% | 150 |
 | Multi-hop, graph expansion on: recall@5 | 100% | 150 |
+| Multi-hop on plain text, names not listed: recall@5 | 0% | 150 |
+| Multi-hop on plain text, names found on write: recall@5 | 69.3% | 150 |
 
 ```bash
 python evals/run.py --check
@@ -471,6 +490,7 @@ How to read this:
 
 - These scenarios test what the engine guarantees. They are generated, not taken from real conversations, and the retrieval rows use the built-in embedder, which matches words and spelling and not meaning. The heavily misspelled row shows its limit.
 - The suite was written alongside the engine and was used to tune it. It caught a real flaw: recently used memories were outranking better matches. Treat it as regression protection, not as an independent benchmark.
+- The two plain-text rows ask the multi-hop question of ordinary sentences with no names listed. Finding names on write makes the hop possible. The misses at 69.3% are ranking, not missing links: with `graph_carry` raised from 0.7 to 0.9 the same run finds 98.0%.
 - It does not measure answer quality on real conversations. The next section does that for retrieval.
 
 ## LongMemEval benchmark
@@ -508,8 +528,17 @@ What each text setting contributes (indexed by round, at least one evidence sess
 | Stopword removal only | 77.9% | 89.8% | 93.4% | 96.4% |
 | Both (the default) | 78.9% | 89.8% | 93.2% | 97.2% |
 
+What finding names on write changes (indexed by round, at least one evidence session found):
+
+| Settings | @1 | @3 | @5 | @10 |
+|---|---|---|---|---|
+| Names not found (the default) | 78.9% | 89.8% | 93.2% | 97.2% |
+| Names found, graph expansion off | 82.8% | 91.3% | 93.6% | 97.2% |
+| Names found, graph expansion on | 58.7% | 83.6% | 91.5% | 97.2% |
+
 ```bash
 python benchmarks/longmemeval.py --download
+python benchmarks/longmemeval.py --tuning '{"extract_entities": true, "graph_carry": 0}'
 ```
 
 How to read this:
@@ -517,6 +546,7 @@ How to read this:
 - **Protocol.** For each question a fresh store is filled with that question's history and queried once with the question text. Nothing is tuned per question. The 30 abstention questions have no evidence session and are left out, as in the paper. The script, the dataset version and the settings are all in the repository, so the run can be repeated. It takes under four minutes on a laptop.
 - **What it shows.** With word and spelling matching alone, an answer-bearing session is the first result for 78.9% of questions and in the top 10 for 97.2%. Indexing by round beats indexing by whole session at every cut-off.
 - **How the defaults were chosen.** Stemming and stopword removal became the defaults after the comparison above, which was run on this same benchmark. LongMemEval has no separate development set, so read the default row as tuned on the test data. Both are standard text-search techniques and were not fitted to individual questions. Two further settings were tried and left off because they lowered recall: a minimum vector similarity of 0.05 (96.8% at 10) and of 0.1 (95.5% at 10).
+- **Finding names.** With `extract_entities` on and graph expansion off, a question that names something gets a third ranker voting for the memories that mention it. Every cut-off improves or holds, indexed by round (the table above) and by session (79.4%, 89.8%, 93.4% and 96.4%, against 73.8%, 87.0%, 91.7% and 95.7%). With graph expansion also following the found names, each good match pulls in other memories that share a name with it. On these single-fact questions that crowds the first result (58.7%), though every evidence session is in the top 10 more often (89.8% against 87.4%). Graph expansion is on by default and cannot yet tell a listed name from a found one, so name finding stays off by default. For a store of chat history, turn it on and set `graph_carry` to 0. Where questions need a hop, keep graph expansion. Like the text settings, this was measured on the test data.
 - **Where it is weak.** Preference questions ask for advice that depends on something the user once mentioned, and share few words with it. That needs meaning-based matching. The script accepts `--tuning` to change any engine setting and `--embedder fastembed` to add a small local embedding model; it works, but a full run takes several hours on a laptop CPU and its results are not published here.
 - **What it does not show.** This is retrieval only. End-to-end answer accuracy needs a reader model and a judge on top, and has not been measured. No comparison with other systems is made here: published numbers for them use different models and settings.
 - **Data.** The dataset is the authors' cleaned release on Hugging Face (`xiaowu0162/longmemeval-cleaned`, MIT licence). It is downloaded to a local cache when the script runs and is not part of this repository.
@@ -556,6 +586,7 @@ Nothing that shapes behaviour is buried in the code. Every ranking and indexing 
 MemoryStore.default_tuning()
 # {"stem_language": "english", "drop_stopwords": True, "trigram_weight": 0.5,
 #  "min_vector_similarity": 0.0,
+#  "extract_entities": False, "max_extracted_entities": 16,
 #  "rrf_k": 60.0, "pool_factor": 4, "min_pool": 32, "bm25_k1": 1.2, "bm25_b": 0.75,
 #  "graph_seeds_per_ranker": 5, "graph_carry": 0.7, "graph_frontier": 16,
 #  "weight_trusted": 1.0, "weight_standard": 0.99, "weight_untrusted": 0.9,
@@ -581,12 +612,12 @@ A value out of range, or a setting name that does not exist, is refused with the
 | Area | Built and tested | Planned |
 |---|---|---|
 | Engine | Scopes, role policies, grants, taint, bi-temporal chains, signed log, decay, TTL, erasure, columnar segments, inverted keyword index, filtered HNSW vector index with parallel build | Sharding across machines |
-| Retrieval | BM25, vector, entity match, rank fusion, graph expansion, token budget, point-in-time, explainable hits, pluggable reranker | Entity extraction at write time, learned reranker |
+| Retrieval | BM25, vector, entity match, rank fusion, graph expansion, token budget, point-in-time, explainable hits, pluggable reranker, names found on write (off by default) | Graph expansion that tells listed names from found ones, learned reranker |
 | Safety | Trust tiers, signed provenance, injection guard, PII guard, review queue | Model-based injection detection |
 | Python | Typed SDK with type stubs, async API, pluggable embedder, consolidator, prompt context, validated configuration | Streaming consolidation |
 | Integrations | LangChain retriever and tools, LangGraph `BaseStore`, LangGraph example, MCP server tested over stdio, optional LangSmith tracing | |
 | Storage | In-memory and single-file log, crash recovery, atomic multi-step writes, optional sync on every write | Snapshots, Postgres backend, server mode |
-| Evaluation | 41 engine tests, 49 SDK tests, behaviour eval suite, load benchmark, LongMemEval retrieval benchmark | LongMemEval end-to-end answer accuracy, LoCoMo |
+| Evaluation | 60 engine tests, 50 SDK tests, behaviour eval suite, load benchmark, LongMemEval retrieval benchmark | LongMemEval end-to-end answer accuracy, LoCoMo |
 | Code quality | `rustfmt`, Clippy with warnings as errors, Ruff and mypy, all enforced in CI | |
 | Packaging | CI on Linux, macOS and Windows; release pipeline for wheels on five platforms, source distribution and crate ([RELEASING.md](RELEASING.md)) | First release to PyPI and crates.io |
 

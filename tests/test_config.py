@@ -95,6 +95,19 @@ def test_stemming_and_stopwords_can_be_turned_off():
     assert keyword_rank(plain)[1] != 1 or keyword_rank(plain)[0] != "Dana booked the venue"
 
 
+def test_names_can_be_found_on_write():
+    finding = MemoryStore("k", tuning={"extract_entities": True, "max_extracted_entities": 2})
+    written = finding.write(ANA, "We moved Apollo from Dana Reyes to the Lisbon office", scope=TEAM, now=T0)
+    assert finding.get(ANA, written, now=T0).entities == ("Apollo", "Dana Reyes")
+
+    default = MemoryStore("k")
+    written = default.write(ANA, "We moved Apollo from Dana Reyes to the Lisbon office", scope=TEAM, now=T0)
+    assert default.get(ANA, written, now=T0).entities == ()
+
+    with pytest.raises(ValueError, match="max_extracted_entities"):
+        MemoryStore("k", tuning={"max_extracted_entities": 0})
+
+
 def test_unknown_stemming_language_is_refused():
     with pytest.raises(ValueError, match="unknown stemming language"):
         MemoryStore("k", tuning={"stem_language": "klingon"})

@@ -3,8 +3,9 @@
 
 use crate::ann::Hnsw;
 use crate::config::Tuning;
+use crate::entities;
 use crate::identity::{default_roles, Grant, Identity, RolePolicy, Scope, ScopeKind};
-use crate::index::{cosine, dot, hash_embed, rrf, sort_desc, top_ids, HASH_DIM};
+use crate::index::{cosine, dot, hash_embed, rrf, rrf_tied, sort_desc, top_ids, HASH_DIM};
 use crate::memory::{
     Assertion, Memory, MemoryKind, NewMemory, Trust, APPROVED_PREFIX,
     DEFAULT_REQUIRED_CORROBORATIONS,
@@ -12,7 +13,7 @@ use crate::memory::{
 use crate::provenance;
 use crate::text::Tokenizer;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -288,11 +289,13 @@ struct Segment {
     vecs: Vec<f32>,
     /// Term to (row, term frequency), rows ascending.
     postings: HashMap<String, Vec<(u32, u32)>>,
-    with_entities: Vec<u32>,
     with_embedding: Vec<u32>,
-    /// Lower-cased entity name to the rows that mention it: the edges of the
-    /// entity graph.
+    /// Entity name, as [`entities::key`] writes it, to the rows that mention
+    /// it: the edges of the entity graph.
     entity_rows: HashMap<String, Vec<u32>>,
+    /// Most words in any name ever indexed here. Bounds how long a phrase
+    /// of a question is worth looking up as a name.
+    longest_entity: usize,
     /// Approximate index over `vecs`; node n is row n.
     hash_ann: Hnsw,
     emb: Option<Embeddings>,
@@ -301,8 +304,8 @@ struct Segment {
 fn entity_names(m: &Memory) -> BTreeSet<String> {
     m.entities
         .iter()
-        .filter(|e| !e.trim().is_empty())
-        .map(|e| e.to_lowercase())
+        .map(|e| entities::key(e))
+        .filter(|name| !name.is_empty())
         .collect()
 }
 
@@ -367,11 +370,21 @@ struct View {
     rows: Vec<u32>,
 }
 
+/// The text a memory is found by: its content, then any name listed for
+/// it that the content does not spell out. A name the content already
+/// contains is not added again, so listing it does not count it twice.
 fn index_text(m: &Memory) -> String {
     let mut text = m.content.clone();
+    if m.entities.is_empty() {
+        return text;
+    }
+    let spoken = format!(" {} ", entities::key(&m.content));
     for e in &m.entities {
-        text.push(' ');
-        text.push_str(e);
+        let name = entities::key(e);
+        if !name.is_empty() && !spoken.contains(&format!(" {name} ")) {
+            text.push(' ');
+            text.push_str(e);
+        }
     }
     text
 }
@@ -615,10 +628,9 @@ impl MemoryStore {
                 for (term, count) in term_counts(tokens) {
                     segment.postings.entry(term).or_default().push((row, count));
                 }
-                if !m.entities.is_empty() {
-                    segment.with_entities.push(row);
-                }
                 for name in entity_names(&m) {
+                    let words = name.split(' ').count();
+                    segment.longest_entity = segment.longest_entity.max(words);
                     segment.entity_rows.entry(name).or_default().push(row);
                 }
                 if let Some(embedding) = &m.embedding {
@@ -944,6 +956,27 @@ impl MemoryStore {
             trust = trust.min(source.trust);
         }
 
+        // Names the caller listed come first; names found in the text are
+        // added behind them, without repeating one already listed.
+        let mut names = new.entities;
+        if self.cfg.tuning.extract_entities {
+            let mut listed: HashSet<String> = names.iter().map(|e| entities::key(e)).collect();
+            let limit = self.cfg.tuning.max_extracted_entities;
+            // Only names already used in the scope being written to count
+            // as known, so nothing is learned from a scope the reader of
+            // this memory might not see.
+            let segment = self
+                .segment_of
+                .get(&(who.tenant.clone(), new.scope.clone()))
+                .map(|at| &self.segments[*at]);
+            let known = |name: &str| segment.is_some_and(|s| s.entity_rows.contains_key(name));
+            for name in entities::extract(&new.content, limit, known) {
+                if listed.insert(entities::key(&name)) {
+                    names.push(name);
+                }
+            }
+        }
+
         let id = self.next_id;
         let valid_from = new.valid_from.unwrap_or(now);
         let mut memory = Memory {
@@ -953,7 +986,7 @@ impl MemoryStore {
             kind: new.kind,
             content: new.content,
             subject: new.subject,
-            entities: new.entities,
+            entities: names,
             tags: new.tags,
             embedding: new.embedding,
             author_user: who.user.clone(),
@@ -1239,27 +1272,71 @@ impl MemoryStore {
         top_ids(scored, pool)
     }
 
-    fn rank_entity(&self, views: &[View], text: &str, pool: usize) -> Vec<u64> {
-        let lowered = text.to_lowercase();
-        let mut scored: Vec<(u64, f32)> = Vec::new();
-        for view in views {
-            let seg = &self.segments[view.segment];
-            for row in seg.with_entities.iter().filter(|r| view.mask[**r as usize]) {
-                let id = seg.rows[*row as usize].id;
-                let Some(m) = self.memories.get(&id) else {
-                    continue;
-                };
-                let named = m
-                    .entities
-                    .iter()
-                    .filter(|e| !e.is_empty() && lowered.contains(&e.to_lowercase()))
-                    .count();
-                if named > 0 {
-                    scored.push((id, named as f32));
+    /// The names a question may be asking about, as index keys.
+    ///
+    /// When names are found on write, the names in a question are found by
+    /// the same rules, so an ordinary word such as "budget" is not taken for
+    /// a name because some memory has it in a heading. Otherwise the caller
+    /// listed the names, and every phrase of the question is tried against
+    /// them, whole words only.
+    fn names_asked(&self, views: &[View], text: &str) -> Vec<String> {
+        let named = |name: &str| {
+            views
+                .iter()
+                .any(|view| self.segments[view.segment].entity_rows.contains_key(name))
+        };
+        let mut names: Vec<String> = if self.cfg.tuning.extract_entities {
+            entities::extract(text, usize::MAX, named)
+                .iter()
+                .map(|name| entities::key(name))
+                .collect()
+        } else {
+            let words = entities::words(text);
+            let longest = views
+                .iter()
+                .map(|view| self.segments[view.segment].longest_entity)
+                .max()
+                .unwrap_or(0)
+                .min(words.len());
+            (1..=longest)
+                .flat_map(|length| words.windows(length).map(|phrase| phrase.join(" ")))
+                .collect()
+        };
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Rank memories by the names they share with the question. The cost
+    /// follows the length of the question and not the number of memories.
+    /// A name that many eligible memories mention counts for less, by the
+    /// same rule graph expansion uses, and a name that more memories mention
+    /// than a ranker may return is skipped: it cannot narrow the search.
+    /// Returns the best `pool`, best first, with scores.
+    fn rank_entity(&self, views: &[View], text: &str, pool: usize) -> Vec<(u64, f32)> {
+        let mut scores: HashMap<u64, f32> = HashMap::new();
+        for name in self.names_asked(views, text) {
+            let mut mentioned_by: Vec<u64> = Vec::new();
+            for view in views {
+                let seg = &self.segments[view.segment];
+                for row in seg.entity_rows.get(&name).into_iter().flatten() {
+                    if view.mask[*row as usize] {
+                        mentioned_by.push(seg.rows[*row as usize].id);
+                    }
                 }
             }
+            if mentioned_by.len() > pool {
+                continue;
+            }
+            let weight = 1.0 / (mentioned_by.len() as f32).sqrt();
+            for id in mentioned_by {
+                *scores.entry(id).or_insert(0.0) += weight;
+            }
         }
-        top_ids(scored, pool)
+        let mut ranked: Vec<(u64, f32)> = scores.into_iter().collect();
+        sort_desc(&mut ranked);
+        ranked.truncate(pool);
+        ranked
     }
 
     /// Graph expansion by spreading activation. Each starting memory passes a
@@ -1365,11 +1442,10 @@ impl MemoryStore {
             let keyword =
                 self.rank_keyword(&views, &self.tokenizer.tokens(&q.text), count, length, pool);
             let vector = self.rank_vector(&views, q, pool);
-            let entity = self.rank_entity(&views, &q.text, pool);
-            let mut fused = rrf(
-                &[keyword.clone(), vector.clone(), entity.clone()],
-                self.cfg.tuning.rrf_k,
-            );
+            let named = self.rank_entity(&views, &q.text, pool);
+            let mut fused = rrf(&[keyword.clone(), vector.clone()], self.cfg.tuning.rrf_k);
+            rrf_tied(&mut fused, &named, self.cfg.tuning.rrf_k);
+            let entity: Vec<u64> = named.into_iter().map(|entry| entry.0).collect();
 
             // The best few matches from each ranker are where the graph starts.
             let mut seeds: Vec<(u64, f32)> = Vec::new();
@@ -1661,5 +1737,34 @@ impl MemoryStore {
             quarantined: self.quarantined,
             recovered_bytes: self.recovered_bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_listed_name_is_indexed_only_if_the_text_lacks_it() {
+        let mut store = MemoryStore::in_memory(StoreConfig::new("test-key"));
+        let who = Identity {
+            tenant: "acme".into(),
+            user: "ana".into(),
+            agent: "a1".into(),
+            role: "researcher".into(),
+            team: Some("task-1".into()),
+            session: None,
+        };
+        let mut new = NewMemory::new(
+            Scope::Team("task-1".into()),
+            MemoryKind::Semantic,
+            "Dana booked the venue in New York",
+        );
+        new.entities = vec!["Dana".into(), "new-york".into(), "Northwind Events".into()];
+        let id = store.write(&who, new, 0).unwrap();
+        assert_eq!(
+            index_text(&store.memories[&id]),
+            "Dana booked the venue in New York Northwind Events"
+        );
     }
 }

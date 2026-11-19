@@ -30,6 +30,17 @@ pub struct Tuning {
     /// recall at ten by 0.4 and 1.7 points.
     pub min_vector_similarity: f32,
 
+    // ---- Names ------------------------------------------------------
+    /// Find the names a memory mentions when it is written, from
+    /// capitalisation alone, and add them to the ones the caller
+    /// supplied. Graph expansion and the name ranker then work without
+    /// the caller listing names. Suits languages that capitalise names
+    /// and little else.
+    pub extract_entities: bool,
+    /// Most names kept per memory when extracting. The most frequent in
+    /// the text are kept.
+    pub max_extracted_entities: usize,
+
     // ---- Rank fusion -------------------------------------------------
     /// Reciprocal rank fusion constant. Larger values flatten the gap
     /// between first and later ranks. 60 is the value from the original
@@ -92,6 +103,8 @@ impl Default for Tuning {
             drop_stopwords: true,
             trigram_weight: 0.5,
             min_vector_similarity: 0.0,
+            extract_entities: false,
+            max_extracted_entities: 16,
             rrf_k: 60.0,
             pool_factor: 4,
             min_pool: 32,
@@ -151,6 +164,7 @@ impl Tuning {
         let counts = [
             ("pool_factor", self.pool_factor),
             ("min_pool", self.min_pool),
+            ("max_extracted_entities", self.max_extracted_entities),
             ("graph_frontier", self.graph_frontier),
             ("ann_min_ef", self.ann_min_ef),
             ("chars_per_token", self.chars_per_token),
